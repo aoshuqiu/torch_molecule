@@ -436,7 +436,7 @@ def add_vtarg_and_adv(seg, gamma, lam):
     计算At(adv), 与q函数(tdlamret)
     '''
     new = np.append(seg['new'],0)
-    vpred = np.append(seg['vpred'], seg['nextvpred'])
+    vpred = np.append(seg['vpred'], seg['nextvpred'].detach())
     T = len(seg["rew"])
     seg["adv"] = gaelam = np.empty(T, 'float32')
     rew = seg['rew']
