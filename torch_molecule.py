@@ -15,6 +15,8 @@ import os
 import copy
 import sys
 
+from torch.utils.tensorboard import SummaryWriter
+
 class Dataset(object):
     def __init__(self, data_map, deterministic=False, shuffle=True):
         self.data_map = data_map
@@ -387,6 +389,7 @@ class traj_segment_generator:
             cur_ep_ret_env += rew_env
             cur_ep_len += 1
 
+
             if new:
                 with open("molecule_gen/"+name+'.csv', 'a') as f:
                     str = ''.join(['{},']*(len(info)+3))[:-1]+'\n'
@@ -394,10 +397,10 @@ class traj_segment_generator:
                     rew_d_final, cur_ep_ret, info['flag_steric_strain_filter'], info['flag_zinc_molecule_filter'], info['stop']))
                 ob_adjs_final.append(ob['adj'])
                 ob_nodes_final.append(ob['node'])
-                ep_rets.append(cur_ep_ret_env)
+                ep_rets.append(cur_ep_ret)
                 ep_rets_env.append(cur_ep_ret_env)
-                ep_rets_d_step.append(cur_ep_ret_d_step)
-                ep_rets_d_final.append(cur_ep_ret_d_final)
+                ep_rets_d_step.append(cur_ep_ret_d_step.detach())
+                ep_rets_d_final.append(cur_ep_ret_d_final.detach())
                 ep_lens.append(cur_ep_len)
                 ep_lens_valid.append(cur_ep_len_valid)
                 ep_rew_final.append(rew_env)
@@ -455,7 +458,8 @@ def loss_g_gen_discriminator(adj, node, dis):
 
 def learn(env, timesteps_per_actorbatch, gamma, lam, 
             optim_batchsize, optim_epochs, optim_lr, clip_param=0.2, entcoeff=0.01,
-            expert_start=0, expert_end=1e6, rl_start=250, rl_end=1e6, curriculum_num=6, curriculum_step=200):
+            expert_start=0, expert_end=1e6, rl_start=250, rl_end=1e6, curriculum_num=6, curriculum_step=200, 
+            name="test", save_every=200, writer=None, load_name=""):
     pi = GCNPolicy()
     old_pi = GCNPolicy()
     dis_step = Discriminator()
@@ -485,6 +489,13 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
     adam_step_dis = torch.optim.Adam(dis_step.parameters(), lr=optim_lr)
     adam_final_dis = torch.optim.Adam(dis_final.parameters(), lr=optim_lr)
 
+    if len(load_name) > 0:
+        full_name = './ckpt/' + load_name + ".pt"
+        ckpt = torch.load(full_name)
+        pi.load_state_dict(ckpt["pi"])
+        dis_step.load_state_dict(ckpt["loss_d_step"])
+        dis_final.load_state_dict(ckpt["loss_d_final"])
+        iters_so_far = int(load_name.split('_')[-1])+1
 
     while True:
         seg = seg_gen.__next__()
@@ -501,15 +512,19 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
         vpredbefore = seg['vpred']  # 更新前的预测value
         atarg = (atarg - atarg.mean()) / atarg.std() # 标准化atarg
 
+        
+
         d = Dataset(dict(ob_adj=ob_adj, ob_node=ob_node, ac=ac, atarg=atarg, vtarg=tdlamret), shuffle=1)
         optim_batchsize = optim_batchsize or ob_adj.shape[0]
 
         for i_optim in range(optim_epochs):
             
             loss_expert = 0
-            loss_expert_stop = 0
             g_expert = 0
             g_expert_stop = 0
+
+            #####
+            total_loss = 0
 
             loss_d_step = 0
             loss_d_final = 0
@@ -518,6 +533,7 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
             g_d_final = 0
 
             pretrain_shift = 5
+            losses = {"surr":0, "pol_entpen":0, "vf":0, "kl":0, "entropy":0}
 
             ## Expert
             if iters_so_far>=expert_start and iters_so_far<=expert_end+pretrain_shift:
@@ -567,7 +583,7 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
                     ret = torch.Tensor(batch["vtarg"])
                     vf_loss = torch.mean(torch.square(pi.vpred - ret)) # 价值函数的loss
                     total_loss = loss_surr + pol_entpen + vf_loss  # PPO阶段的loss
-                    losses = {"loss_surr":loss_surr, "pol_entpen":pol_entpen, "vf_loss":vf_loss, "kl":meankl, "entropy":meanent}
+                    losses = {"surr":loss_surr, "pol_entpen":pol_entpen, "vf":vf_loss, "kl":meankl, "entropy":meanent}
 
                     adam_pi_ppo.zero_grad()
                     total_loss.backward()
@@ -599,26 +615,78 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
                     adam_final_dis.zero_grad()
                     loss_d_final.backward()
                     adam_final_dis.step()
+        
+        lenbuffer.extend(seg["ep_lens"])
+        lenbuffer_valid.extend(seg["ep_lens_valid"])
+        rewbuffer.extend(seg["ep_rets"])
+        rewbuffer_env.extend(seg["ep_rets_env"])
+        rewbuffer_d_step.extend(seg["ep_rets_d_step"])
+        print(seg["ep_rets_d_step"][0])
+        rewbuffer_d_final.extend(seg["ep_rets_d_final"])
+        rewbuffer_final.extend(seg["ep_final_rew"])
+        rewbuffer_final_stat.extend(seg["ep_final_rew_stat"])
+
+        if writer:
+            writer.add_scalar("loss_expert", loss_expert, iters_so_far)
+            writer.add_scalar("loss_d_step", loss_d_step, iters_so_far)
+            writer.add_scalar("loss_d_final", loss_d_final, iters_so_far)
+            for loss_name in losses:
+                writer.add_scalar("loss_"+loss_name, losses[loss_name], iters_so_far)
+            writer.add_scalar("total_loss", total_loss, iters_so_far)
+            writer.add_scalar("ep_ret_mean", np.mean(rewbuffer), iters_so_far)
+            writer.add_scalar("ep_len_mean", np.mean(lenbuffer), iters_so_far)
+            writer.add_scalar("ep_len_valid_mean", np.mean(lenbuffer_valid), iters_so_far)
+            writer.add_scalar("ep_ret_env_mean", np.mean(rewbuffer_env), iters_so_far)
+            writer.add_scalar("ep_rew_d_step_mean", np.mean(rewbuffer_d_step), iters_so_far)
+            writer.add_scalar("ep_rew_d_final_mean", np.mean(rewbuffer_d_final), iters_so_far)
+            writer.add_scalar("ep_rew_final_mean", np.mean(rewbuffer_final), iters_so_far)
+            writer.add_scalar("ep_rew_final_stat_mean", np.mean(rewbuffer_final_stat), iters_so_far)
+
+
+        if iters_so_far % save_every == 0:
+            fname = './ckpt/' + name + '_' + str(iters_so_far) + ".pt"
+            torch.save({
+                "pi": pi.state_dict(),
+                "loss_d_step": dis_step.state_dict(),
+                "loss_d_final": dis_final.state_dict()
+            }, fname)
+
+        
 
         iters_so_far += 1
         counter += 1
         if (not counter % curriculum_step) and counter//curriculum_step < curriculum_num:
             level += 1
 
-        with open('molecule_gen/test.csv', 'a') as f:
+        with open("molecule_gen/"+name+'.csv', 'a') as f:
                 f.write('***** Iteration {} *****\n'.format(iters_so_far))
 
+def arg_parser():
+    import argparse
+    return argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+
+def mol_arg_parser():
+    parser = arg_parser()
+    parser.add_argument("--name", type=str, default="test")
+    parser.add_argument('--name_load', type=str, default="")
+    parser.add_argument("--reward_type", type=str, default="logppen")
+    return parser
+
 def main():
-    print("i")
+
+    args = mol_arg_parser().parse_args()
     print(os.path.abspath("molecule_gen"))
     if not os.path.exists("molecule_gen"):
-        print("makedirs")
         os.makedirs("./molecule_gen")
+    if not os.path.exists("ckpt"):
+        os.makedirs("./ckpt")
     env = gym.make("molecule-v0")
-    env.init(reward_type= "qedsa")
-    print(env.observation_space)
+    env.init(reward_type= args.reward_type)
+
+
+    writer = SummaryWriter()
     # 256 32 8
-    learn(env, 256, 1, 0.95, 32, 8, 1e-3)
+    learn(env, 256, 1, 0.95, 32, 8, 1e-3, writer=writer, load_name=args.name_load, name=args.name)
 
 if __name__ == '__main__':
     main()
