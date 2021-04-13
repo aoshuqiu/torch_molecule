@@ -16,6 +16,7 @@ import copy
 import sys
 
 from torch.utils.tensorboard import SummaryWriter
+from contextlib import contextmanager
 
 class Dataset(object):
     def __init__(self, data_map, deterministic=False, shuffle=True):
@@ -369,7 +370,6 @@ class traj_segment_generator:
             news[i] = new
             acs[i] = ac
             prevacs[i] = prevac
-
             ob, rew_env, new, info = env.step(ac)
             rew_d_step = 0
             if rew_env > 0:
@@ -395,6 +395,8 @@ class traj_segment_generator:
                     str = ''.join(['{},']*(len(info)+3))[:-1]+'\n'
                     f.write(str.format(info['smile'], info['reward_valid'], info['reward_qed'], info['reward_sa'], info['final_stat'], rew_env, rew_d_step, 
                     rew_d_final, cur_ep_ret, info['flag_steric_strain_filter'], info['flag_zinc_molecule_filter'], info['stop']))
+                    if float(info["reward_qed"])>0.9:
+                        print("OMG finally!")
                 ob_adjs_final.append(ob['adj'])
                 ob_nodes_final.append(ob['node'])
                 ep_rets.append(cur_ep_ret)
@@ -479,7 +481,7 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
     rewbuffer_final_stat = deque(maxlen=100)
 
     traj_gen = traj_segment_generator(pi,env, timesteps_per_actorbatch, dis_step, dis_final)
-    seg_gen = traj_gen.get_generator()
+    seg_gen = traj_gen.get_generator(name=name)
     counter = 0
     level = 0
 
@@ -502,10 +504,12 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
         # 用新策略模型的参数为旧策略模型赋值，旧策略不需要计算梯度, 源码不在这，在ppo里 
         # 没理解为啥 本来就是从oldpi中采样才对，放在ppo的括号里每次pi都会等于old_pi, 没有体现重要性采样
         # 先这样试试
+
         for param_new, param_old in zip(pi.named_parameters(),old_pi.named_parameters()):
             assert param_new[0] == param_old[0]
-            param_old[1].data = param_new[1].data
+            param_old[1].data = param_new[1].data.detach().clone()
             param_old[1].requires_grad = False
+        
 
         add_vtarg_and_adv(seg, gamma, lam)
         ob_adj, ob_node, ac, atarg, tdlamret = seg['ob_adj'], seg['ob_node'], seg['ac'], seg['adv'], seg['tdlamret']
@@ -533,7 +537,6 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
             g_d_final = 0
 
             pretrain_shift = 5
-            losses = {"surr":0, "pol_entpen":0, "vf":0, "kl":0, "entropy":0}
 
             ## Expert
             if iters_so_far>=expert_start and iters_so_far<=expert_end+pretrain_shift:
@@ -541,7 +544,6 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
                 pi.set_ac_real(ac_expert)
                 ac_pred, v_pred = pi.forward(ob_expert['adj'],ob_expert['node'])
 
-                # 这里有问题，原来使用ac_expert的 TODO
                 pi_logp = pi.logp(ac_expert)
 
                 loss_expert = - torch.mean(pi_logp) 
@@ -574,7 +576,8 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
                     meankl = torch.mean(kl_oldnew)
 
                     ratio = torch.exp(pi_logp - old_pi_logp) # pnew(ac)/pold(ac)
-                    print(type(ratio))
+
+
                     atarg = torch.Tensor(atarg)
                     surr1 = ratio * atarg
                     surr2 = torch.clip(ratio, 1.0 - clip_param, 1.0 + clip_param) * atarg
@@ -584,10 +587,11 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
                     vf_loss = torch.mean(torch.square(pi.vpred - ret)) # 价值函数的loss
                     total_loss = loss_surr + pol_entpen + vf_loss  # PPO阶段的loss
                     losses = {"surr":loss_surr, "pol_entpen":pol_entpen, "vf":vf_loss, "kl":meankl, "entropy":meanent}
-
+                    
                     adam_pi_ppo.zero_grad()
                     total_loss.backward()
                     adam_pi_ppo.step()
+                    
                 if i_optim >= optim_epochs//2:
                     # 更新过程判别器
                     ob_expert ,_ = env.get_expert(optim_batchsize)
@@ -616,12 +620,46 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
                     loss_d_final.backward()
                     adam_final_dis.step()
         
+        losses = {"surr":0, "pol_entpen":0, "vf":0, "kl":0, "entropy":0}
+        with torch.no_grad():
+            losses_arr = []
+            for batch in d.iterate_once(optim_batchsize):
+                pi.set_ac_real(batch["ac"])
+                old_pi.set_ac_real(batch["ac"])
+                batch_acs = batch["ac"]
+                atarg = batch["atarg"]
+                # 又想了一哈，源码中batch['ob']其实是不需要的，batch['ob']是已经经过pi的ob，但目前要跑一次算loss
+                pi.forward(batch["ob_adj"],batch["ob_node"])
+                old_pi.forward(batch["ob_adj"],batch["ob_node"])
+                pi_logp = pi.logp(batch_acs)
+                old_pi_logp = old_pi.logp(batch_acs)
+
+                # 熵惩罚，不能让熵太小，要让agent可以有更多选择
+                ent = pi.entorpy()
+                meanent = torch.mean(ent)
+                pol_entpen = (-entcoeff) * meanent
+                # 两个分布的kl散度
+                kl_oldnew = old_pi.kl(pi.pd)
+                meankl = torch.mean(kl_oldnew)
+
+                ratio = torch.exp(pi_logp - old_pi_logp) # pnew(ac)/pold(ac)
+                atarg = torch.Tensor(atarg)
+                surr1 = ratio * atarg
+                surr2 = torch.clip(ratio, 1.0 - clip_param, 1.0 + clip_param) * atarg
+                loss_surr = - torch.mean(torch.minimum(surr1, surr2)) # 加负号将目标函数值变为loss
+                        
+                ret = torch.Tensor(batch["vtarg"])
+                vf_loss = torch.mean(torch.square(pi.vpred - ret)) # 价值函数的loss
+                losses_arr.append([loss_surr, pol_entpen, vf_loss, meankl, meanent])
+            losses_arr = np.mean(np.array(losses_arr), 0)
+            losses = {"surr":losses_arr[0], "pol_entpen":losses_arr[1], "vf":losses_arr[2], "kl":losses_arr[3], "entropy":losses_arr[4]}
+
+
         lenbuffer.extend(seg["ep_lens"])
         lenbuffer_valid.extend(seg["ep_lens_valid"])
         rewbuffer.extend(seg["ep_rets"])
         rewbuffer_env.extend(seg["ep_rets_env"])
         rewbuffer_d_step.extend(seg["ep_rets_d_step"])
-        print(seg["ep_rets_d_step"][0])
         rewbuffer_d_final.extend(seg["ep_rets_d_final"])
         rewbuffer_final.extend(seg["ep_final_rew"])
         rewbuffer_final_stat.extend(seg["ep_final_rew_stat"])
@@ -645,6 +683,7 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
 
         if iters_so_far % save_every == 0:
             fname = './ckpt/' + name + '_' + str(iters_so_far) + ".pt"
+            print("{0}th iter model saved in {1}".format(str(iters_so_far), str(fname)))
             torch.save({
                 "pi": pi.state_dict(),
                 "loss_d_step": dis_step.state_dict(),
@@ -686,6 +725,7 @@ def main():
 
     writer = SummaryWriter()
     # 256 32 8
+    print(args.name)
     learn(env, 256, 1, 0.95, 32, 8, 1e-3, writer=writer, load_name=args.name_load, name=args.name)
 
 if __name__ == '__main__':
