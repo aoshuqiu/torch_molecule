@@ -64,21 +64,45 @@ class Dataset(object):
             data_map[key] = self.data_map[key][:num_elements]
         return Dataset(data_map, deterministic)
 
+class TriEdgeLinear(nn.Module):
+    __constant__=['in_features','out_features']
+    in_features: int
+    out_features: int
+    weight1: torch.Tensor
+    weight2: torch.Tensor
+    weight3: torch.Tensor
+    
+    def __init__(self, in_features: int, out_features: int) -> None:
+        super(TriEdgeLinear, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight1 = nn.Parameter(torch.Tensor(out_features, in_features))
+        self.weight2 = nn.Parameter(torch.Tensor(out_features, in_features))
+        self.weight3 = nn.Parameter(torch.Tensor(out_features, in_features))
+        self.reset_parameters()
+        
+    def reset_parameters(self) -> None:
+        nn.init.xavier_uniform_(self.weight1)
+        nn.init.xavier_uniform_(self.weight2)
+        nn.init.xavier_uniform_(self.weight3)
+    
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        #(B,E,F,F)
+        return ((F.linear(input[:,0,:,:],self.weight1)+F.linear(input[:,1,:,:],self.weight2)\
+            +F.linear(input[:,2,:,:],self.weight3))/3).unsqueeze(1)
+
+
 class GCNPolicy(nn.Module):
-    def __init__(self, out_channels=64, stop_shift=-3, atom_type_num=9,in_channels=9, edge_type=3):
+    def __init__(self, out_channels=128, stop_shift=-3, atom_type_num=9,in_channels=9, edge_type=3, batch_size=32):
         super(GCNPolicy, self).__init__()
         self.stop_shift = stop_shift
         self.atom_type_num = atom_type_num
         self.emb = nn.Linear(in_channels, 8)
         self.ac_real = np.array([])
         
-        self.d_gcn1 = nn.Linear(8, out_channels, bias=False)
-        self.d_gcn2 = nn.Linear(out_channels, out_channels, bias=False)
-        self.d_gcn3 = nn.Linear(out_channels, out_channels, bias=False)
-        
-        self.g_gcn1 = nn.Linear(8, out_channels, bias=False)
-        self.g_gcn2 = nn.Linear(out_channels, out_channels, bias=False)
-        self.g_gcn3 = nn.Linear(out_channels, out_channels, bias=False)
+        self.gcn1 = TriEdgeLinear(8, out_channels)
+        self.gcn2 = TriEdgeLinear(out_channels, out_channels)
+        self.gcn3 = TriEdgeLinear(out_channels, out_channels)
         
         self.linear_stop1 = nn.Linear(out_channels, out_channels, bias=False)
         self.linear_stop2 = nn.Linear(out_channels, 2)
@@ -124,12 +148,10 @@ class GCNPolicy(nn.Module):
             self.node = self.node.unsqueeze(0)
 
         ob_node = self.emb(self.node)
-        emb_node = F.relu(self.g_gcn1(torch.einsum("bijk,bikl->bijl",self.adj,ob_node.tile((1,self.adj.shape[1],1,1)))))
-        emb_node = torch.mean(emb_node,1).unsqueeze(1)
-        emb_node = F.relu(self.g_gcn2(torch.einsum("bijk,bikl->bijl",self.adj,emb_node.tile((1,self.adj.shape[1],1,1)))))
-        emb_node = torch.mean(emb_node,1).unsqueeze(1)
-        emb_node = F.relu(self.g_gcn3(torch.einsum("bijk,bikl->bijl",self.adj,emb_node.tile((1,self.adj.shape[1],1,1)))))
-        emb_node = torch.mean(emb_node,1)
+        emb_node = F.relu(self.gcn1(torch.matmul(self.adj,ob_node)))
+        emb_node = F.relu(self.gcn2(torch.matmul(self.adj,emb_node)))
+        emb_node = F.relu(self.gcn3(torch.matmul(self.adj,emb_node)))
+        emb_node = emb_node.squeeze(1)
         #(B,n,n) * (B,n,f) -> (B,n,f)
         
         seq_range = torch.arange(0, emb_node.shape[-2])
@@ -241,13 +263,13 @@ class Discriminator(nn.Module):
     '''
     判断ob是否为生成的
     '''
-    def __init__(self, in_channels=9, out_channels=64):
+    def __init__(self, pi, in_channels=9, out_channels=128, edge_type=3, batch_size=32):
         super(Discriminator, self).__init__()
-        self.emb = nn.Linear(in_channels, 8, bias=False)
-
-        self.gcn1 = nn.Linear(8, out_channels, bias=False)
-        self.gcn2 = nn.Linear(out_channels, out_channels, bias=False)
-        self.gcn3 = nn.Linear(out_channels, out_channels, bias=False)
+        self.emb = nn.Linear(in_channels, 8)
+        
+        self.gcn1 = TriEdgeLinear(8, out_channels)
+        self.gcn2 = TriEdgeLinear(out_channels, out_channels)
+        self.gcn3 = TriEdgeLinear(out_channels, out_channels)
 
         self.linear1 = nn.Linear(out_channels, out_channels, bias=False)
         self.linear2 = nn.Linear(out_channels, 1)
@@ -258,14 +280,12 @@ class Discriminator(nn.Module):
         if self.adj.dim() == 3:
             self.adj = self.adj.unsqueeze(0)
         if self.node.dim() == 3:
-            self.node = self.node.unsqueeze(0)
+            self.node = self.node.unsqueeze(0)   
         ob_node = self.emb(self.node)
-        emb_node = F.relu(self.gcn1(torch.einsum("bijk,bikl->bijl",self.adj,ob_node.tile((1,self.adj.shape[1],1,1)))))
-        emb_node = torch.mean(emb_node,1).unsqueeze(1)
-        emb_node = F.relu(self.gcn2(torch.einsum("bijk,bikl->bijl",self.adj,emb_node.tile((1,self.adj.shape[1],1,1)))))
-        emb_node = torch.mean(emb_node,1).unsqueeze(1)
-        emb_node = F.relu(self.gcn3(torch.einsum("bijk,bikl->bijl",self.adj,emb_node.tile((1,self.adj.shape[1],1,1)))))
-        emb_node = torch.mean(emb_node,1).unsqueeze(1)
+        emb_node = F.relu(self.gcn1(torch.matmul(self.adj,ob_node)))
+        emb_node = F.relu(self.gcn2(torch.matmul(self.adj,emb_node)))
+        emb_node = F.relu(self.gcn3(torch.matmul(self.adj,emb_node)))
+        emb_node = emb_node.squeeze(1)
 
         emb_node = F.relu(self.linear1(emb_node)) #(B,n,f)
         emb_graph = torch.sum(emb_node, 1) #(B,f)
@@ -461,11 +481,11 @@ def loss_g_gen_discriminator(adj, node, dis):
 def learn(env, timesteps_per_actorbatch, gamma, lam, 
             optim_batchsize, optim_epochs, optim_lr, clip_param=0.2, entcoeff=0.01,
             expert_start=0, expert_end=1e6, rl_start=250, rl_end=1e6, curriculum_num=6, curriculum_step=200, 
-            name="test", save_every=200, writer=None, load_name=""):
+            name="test", save_every=50, writer=None, load_name=""):
     pi = GCNPolicy()
     old_pi = GCNPolicy()
-    dis_step = Discriminator()
-    dis_final = Discriminator()
+    dis_step = Discriminator(pi)
+    dis_final = Discriminator(pi)
 
     episodes_so_far = 0
     timesteps_so_far = 0
@@ -486,11 +506,9 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
     level = 0
 
     ## optim.Adam 把原来expert与ppo的参数两次更新拆开了
-    adam_pi_expert = torch.optim.Adam(pi.parameters(), lr=optim_lr*0.05)
-    adam_pi_ppo = torch.optim.Adam(pi.parameters(), lr=optim_lr*0.2)
-    adam_step_dis = torch.optim.Adam(dis_step.parameters(), lr=optim_lr)
+    adam_pi = torch.optim.Adam(pi.parameters(), lr=optim_lr)
+    adam_step_dis = torch.optim.Adam(dis_step.parameters(), lr=optim_lr) 
     adam_final_dis = torch.optim.Adam(dis_final.parameters(), lr=optim_lr)
-
     if len(load_name) > 0:
         full_name = './ckpt/' + load_name + ".pt"
         ckpt = torch.load(full_name)
@@ -546,11 +564,7 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
 
                 pi_logp = pi.logp(ac_expert)
 
-                loss_expert = - torch.mean(pi_logp) 
-
-                adam_pi_expert.zero_grad()
-                loss_expert.backward()
-                adam_pi_expert.step()
+                loss_expert = - torch.mean(pi_logp)
             
             ## PPO
             if iters_so_far>=rl_start and iters_so_far<=rl_end:
@@ -588,10 +602,6 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
                     total_loss = loss_surr + pol_entpen + vf_loss  # PPO阶段的loss
                     losses = {"surr":loss_surr, "pol_entpen":pol_entpen, "vf":vf_loss, "kl":meankl, "entropy":meanent}
                     
-                    adam_pi_ppo.zero_grad()
-                    total_loss.backward()
-                    adam_pi_ppo.step()
-                    
                 if i_optim >= optim_epochs//2:
                     # 更新过程判别器
                     ob_expert ,_ = env.get_expert(optim_batchsize)
@@ -619,6 +629,12 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
                     adam_final_dis.zero_grad()
                     loss_d_final.backward()
                     adam_final_dis.step()
+            
+            loss_pi = 0.05*loss_expert + 0.2*total_loss
+            adam_pi.zero_grad()
+            loss_pi.backward()
+            adam_pi.step()
+                
         
         losses = {"surr":0, "pol_entpen":0, "vf":0, "kl":0, "entropy":0}
         with torch.no_grad():
@@ -708,11 +724,13 @@ def mol_arg_parser():
     parser = arg_parser()
     parser.add_argument("--name", type=str, default="test")
     parser.add_argument('--name_load', type=str, default="")
-    parser.add_argument("--reward_type", type=str, default="logppen")
+    parser.add_argument("--reward_type", type=str, default="qed")
+    parser.add_argument("--reward_step_total", type=float, default=0.5)
     return parser
 
 def main():
-
+    torch.manual_seed(999)
+    torch.autograd.set_detect_anomaly(True)
     args = mol_arg_parser().parse_args()
     print(os.path.abspath("molecule_gen"))
     if not os.path.exists("molecule_gen"):
@@ -720,7 +738,7 @@ def main():
     if not os.path.exists("ckpt"):
         os.makedirs("./ckpt")
     env = gym.make("molecule-v0")
-    env.init(reward_type= args.reward_type)
+    env.init(reward_type= args.reward_type, reward_step_total=args.reward_step_total)
 
 
     writer = SummaryWriter()
