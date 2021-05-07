@@ -68,28 +68,27 @@ class TriEdgeLinear(nn.Module):
     __constant__=['in_features','out_features']
     in_features: int
     out_features: int
-    weight1: torch.Tensor
-    weight2: torch.Tensor
-    weight3: torch.Tensor
+    edge_num: int
+    weight: torch.Tensor
+
     
-    def __init__(self, in_features: int, out_features: int) -> None:
+    def __init__(self, in_features: int, out_features: int, edge_num: int) -> None:
         super(TriEdgeLinear, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.weight1 = nn.Parameter(torch.Tensor(out_features, in_features))
-        self.weight2 = nn.Parameter(torch.Tensor(out_features, in_features))
-        self.weight3 = nn.Parameter(torch.Tensor(out_features, in_features))
+        self.edge_num = edge_num
+        self.weight = nn.Parameter(torch.Tensor(edge_num,out_features, in_features))
         self.reset_parameters()
         
     def reset_parameters(self) -> None:
-        nn.init.xavier_uniform_(self.weight1)
-        nn.init.xavier_uniform_(self.weight2)
-        nn.init.xavier_uniform_(self.weight3)
+        nn.init.xavier_uniform_(self.weight)
     
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         #(B,E,F,F)
-        return ((F.linear(input[:,0,:,:],self.weight1)+F.linear(input[:,1,:,:],self.weight2)\
-            +F.linear(input[:,2,:,:],self.weight3))/3).unsqueeze(1)
+        output = 0
+        for i in range(self.edge_num):
+            output += F.linear(input[:,0,:,:],self.weight[i,:,:])
+        return (output/self.edge_num).unsqueeze(1)
 
 
 class GCNPolicy(nn.Module):
@@ -100,9 +99,9 @@ class GCNPolicy(nn.Module):
         self.emb = nn.Linear(in_channels, 8)
         self.ac_real = np.array([])
         
-        self.gcn1 = TriEdgeLinear(8, out_channels)
-        self.gcn2 = TriEdgeLinear(out_channels, out_channels)
-        self.gcn3 = TriEdgeLinear(out_channels, out_channels)
+        self.gcn1 = TriEdgeLinear(8, out_channels, 3)
+        self.gcn2 = TriEdgeLinear(out_channels, out_channels, 3)
+        self.gcn3 = TriEdgeLinear(out_channels, out_channels, 3)
         
         self.linear_stop1 = nn.Linear(out_channels, out_channels, bias=False)
         self.linear_stop2 = nn.Linear(out_channels, 2)
@@ -267,9 +266,9 @@ class Discriminator(nn.Module):
         super(Discriminator, self).__init__()
         self.emb = nn.Linear(in_channels, 8)
         
-        self.gcn1 = TriEdgeLinear(8, out_channels)
-        self.gcn2 = TriEdgeLinear(out_channels, out_channels)
-        self.gcn3 = TriEdgeLinear(out_channels, out_channels)
+        self.gcn1 = TriEdgeLinear(8, out_channels, 3)
+        self.gcn2 = TriEdgeLinear(out_channels, out_channels, 3)
+        self.gcn3 = TriEdgeLinear(out_channels, out_channels, 3)
 
         self.linear1 = nn.Linear(out_channels, out_channels, bias=False)
         self.linear2 = nn.Linear(out_channels, 1)
