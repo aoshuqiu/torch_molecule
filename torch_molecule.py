@@ -87,7 +87,7 @@ class TriEdgeLinear(nn.Module):
         #(B,E,F,F)
         output = 0
         for i in range(self.edge_num):
-            output += F.linear(input[:,0,:,:],self.weight[i,:,:])
+            output += F.linear(input[:,i,:,:],self.weight[i,:,:])
         return (output/self.edge_num).unsqueeze(1)
 
 
