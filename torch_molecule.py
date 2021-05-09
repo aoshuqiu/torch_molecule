@@ -77,18 +77,14 @@ class TriEdgeLinear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.edge_num = edge_num
-        self.weight = nn.Parameter(torch.Tensor(edge_num,out_features, in_features))
+        self.weight = nn.Parameter(torch.Tensor(edge_num, in_features, out_features))
         self.reset_parameters()
         
     def reset_parameters(self) -> None:
         nn.init.xavier_uniform_(self.weight)
     
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        #(B,E,F,F)
-        output = 0
-        for i in range(self.edge_num):
-            output += F.linear(input[:,i,:,:],self.weight[i,:,:])
-        return (output/self.edge_num).unsqueeze(1)
+        return (torch.mean(torch.matmul(input, self.weight), 1)).unsqueeze(1)
 
 
 class GCNPolicy(nn.Module):
@@ -516,7 +512,9 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
         dis_final.load_state_dict(ckpt["loss_d_final"])
         iters_so_far = int(load_name.split('_')[-1])+1
 
-    while True:
+    #while True:
+
+    for _ in range(10):
         seg = seg_gen.__next__()
         # 用新策略模型的参数为旧策略模型赋值，旧策略不需要计算梯度, 源码不在这，在ppo里 
         # 没理解为啥 本来就是从oldpi中采样才对，放在ppo的括号里每次pi都会等于old_pi, 没有体现重要性采样
@@ -628,47 +626,48 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
                     adam_final_dis.zero_grad()
                     loss_d_final.backward()
                     adam_final_dis.step()
-            
             loss_pi = 0.05*loss_expert + 0.2*total_loss
             adam_pi.zero_grad()
             loss_pi.backward()
             adam_pi.step()
-                
+               
         
         losses = {"surr":0, "pol_entpen":0, "vf":0, "kl":0, "entropy":0}
-        with torch.no_grad():
-            losses_arr = []
-            for batch in d.iterate_once(optim_batchsize):
-                pi.set_ac_real(batch["ac"])
-                old_pi.set_ac_real(batch["ac"])
-                batch_acs = batch["ac"]
-                atarg = batch["atarg"]
-                # 又想了一哈，源码中batch['ob']其实是不需要的，batch['ob']是已经经过pi的ob，但目前要跑一次算loss
-                pi.forward(batch["ob_adj"],batch["ob_node"])
-                old_pi.forward(batch["ob_adj"],batch["ob_node"])
-                pi_logp = pi.logp(batch_acs)
-                old_pi_logp = old_pi.logp(batch_acs)
+        with torch.autograd.profiler.profile() as prof:
+            with torch.no_grad():
+                losses_arr = []
+                for batch in d.iterate_once(optim_batchsize):
+                    pi.set_ac_real(batch["ac"])
+                    old_pi.set_ac_real(batch["ac"])
+                    batch_acs = batch["ac"]
+                    atarg = batch["atarg"]
+                    # 又想了一哈，源码中batch['ob']其实是不需要的，batch['ob']是已经经过pi的ob，但目前要跑一次算loss
+                    pi.forward(batch["ob_adj"],batch["ob_node"])
+                    old_pi.forward(batch["ob_adj"],batch["ob_node"])
+                    pi_logp = pi.logp(batch_acs)
+                    old_pi_logp = old_pi.logp(batch_acs)
 
-                # 熵惩罚，不能让熵太小，要让agent可以有更多选择
-                ent = pi.entorpy()
-                meanent = torch.mean(ent)
-                pol_entpen = (-entcoeff) * meanent
-                # 两个分布的kl散度
-                kl_oldnew = old_pi.kl(pi.pd)
-                meankl = torch.mean(kl_oldnew)
+                    # 熵惩罚，不能让熵太小，要让agent可以有更多选择
+                    ent = pi.entorpy()
+                    meanent = torch.mean(ent)
+                    pol_entpen = (-entcoeff) * meanent
+                    # 两个分布的kl散度
+                    kl_oldnew = old_pi.kl(pi.pd)
+                    meankl = torch.mean(kl_oldnew)
 
-                ratio = torch.exp(pi_logp - old_pi_logp) # pnew(ac)/pold(ac)
-                atarg = torch.Tensor(atarg)
-                surr1 = ratio * atarg
-                surr2 = torch.clip(ratio, 1.0 - clip_param, 1.0 + clip_param) * atarg
-                loss_surr = - torch.mean(torch.minimum(surr1, surr2)) # 加负号将目标函数值变为loss
-                        
-                ret = torch.Tensor(batch["vtarg"])
-                vf_loss = torch.mean(torch.square(pi.vpred - ret)) # 价值函数的loss
-                losses_arr.append([loss_surr, pol_entpen, vf_loss, meankl, meanent])
-            losses_arr = np.mean(np.array(losses_arr), 0)
-            losses = {"surr":losses_arr[0], "pol_entpen":losses_arr[1], "vf":losses_arr[2], "kl":losses_arr[3], "entropy":losses_arr[4]}
-
+                    ratio = torch.exp(pi_logp - old_pi_logp) # pnew(ac)/pold(ac)
+                    atarg = torch.Tensor(atarg)
+                    surr1 = ratio * atarg
+                    surr2 = torch.clip(ratio, 1.0 - clip_param, 1.0 + clip_param) * atarg
+                    loss_surr = - torch.mean(torch.minimum(surr1, surr2)) # 加负号将目标函数值变为loss
+                            
+                    ret = torch.Tensor(batch["vtarg"])
+                    vf_loss = torch.mean(torch.square(pi.vpred - ret)) # 价值函数的loss
+                    losses_arr.append([loss_surr, pol_entpen, vf_loss, meankl, meanent])
+                losses_arr = np.mean(np.array(losses_arr), 0)
+                losses = {"surr":losses_arr[0], "pol_entpen":losses_arr[1], "vf":losses_arr[2], "kl":losses_arr[3], "entropy":losses_arr[4]}
+        print(prof.key_averages().table(sort_by="self_cpu_time_total"))
+        input() 
 
         lenbuffer.extend(seg["ep_lens"])
         lenbuffer_valid.extend(seg["ep_lens_valid"])
@@ -714,6 +713,7 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
 
         with open("molecule_gen/"+name+'.csv', 'a') as f:
                 f.write('***** Iteration {} *****\n'.format(iters_so_far))
+    
 
 def arg_parser():
     import argparse
@@ -729,7 +729,6 @@ def mol_arg_parser():
 
 def main():
     torch.manual_seed(999)
-    torch.autograd.set_detect_anomaly(True)
     args = mol_arg_parser().parse_args()
     print(os.path.abspath("molecule_gen"))
     if not os.path.exists("molecule_gen"):
