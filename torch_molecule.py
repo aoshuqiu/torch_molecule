@@ -18,6 +18,7 @@ import sys
 from torch.utils.tensorboard import SummaryWriter
 from contextlib import contextmanager
 
+from rdkit import Chem
 class Dataset(object):
     def __init__(self, data_map, deterministic=False, shuffle=True):
         self.data_map = data_map
@@ -90,7 +91,7 @@ class TriEdgeLinear(nn.Module):
 
 
 class GCNPolicy(nn.Module):
-    def __init__(self, out_channels=128, stop_shift=-3, atom_type_num=9,in_channels=9, edge_type=3, batch_size=32):
+    def __init__(self, env, out_channels=64, stop_shift=0, atom_type_num=9,in_channels=9, edge_type=3, batch_size=32):
         super(GCNPolicy, self).__init__()
         self.stop_shift = stop_shift
         self.atom_type_num = atom_type_num
@@ -100,17 +101,25 @@ class GCNPolicy(nn.Module):
         self.gcn1 = TriEdgeLinear(8, out_channels, 3)
         self.gcn2 = TriEdgeLinear(out_channels, out_channels, 3)
         self.gcn3 = TriEdgeLinear(out_channels, out_channels, 3)
-        
+
         self.linear_stop1 = nn.Linear(out_channels, out_channels, bias=False)
         self.linear_stop2 = nn.Linear(out_channels, 2)
 
-        self.linear_first1 = nn.Linear(out_channels, out_channels)
+        self.env = env
+
+        self.vocab = env.vocab
+        vocab_size = self.vocab.length
+        #TODO test bias
+        self.linear_motif1 = nn.Linear(out_channels, out_channels, bias=False)
+        self.linear_motif2 = nn.Linear(out_channels, vocab_size)
+
+        self.linear_first1 = nn.Linear(2*out_channels, out_channels)
         self.linear_first2 = nn.Linear(out_channels, 1)
 
-        self.linear_second1 = nn.Linear(2*out_channels, out_channels)
+        self.linear_second1 = nn.Linear(3*out_channels, out_channels)
         self.linear_second2 = nn.Linear(out_channels, 1)
 
-        self.linear_edge1 = nn.Linear(2*out_channels, out_channels)
+        self.linear_edge1 = nn.Linear(4*out_channels, out_channels)
         self.linear_edge2 = nn.Linear(out_channels, edge_type)
 
         self.value1 = nn.Linear(out_channels, out_channels, bias=False)
@@ -156,7 +165,7 @@ class GCNPolicy(nn.Module):
         ob_len = torch.sum(torch.BoolTensor(torch.sum(self.node,-1)>0),-1)
         ob_len_first = ob_len - atom_type_num
         emb_node = self.mask_emb_len(emb_node, ob_len, 0)
-        
+        emb_graph = torch.sum(emb_node,1).unsqueeze(1) #(B,1,f)
 
         ### 2.预测停止动作
         emb_stop = F.relu(self.linear_stop1(emb_node))
@@ -169,9 +178,25 @@ class GCNPolicy(nn.Module):
         ac_stop = pd_stop.sample() #(B,1)
         ac_stop = ac_stop.unsqueeze(-1)
 
+        ### new 选一个motif
+        emb_getmotif = F.relu(self.linear_motif1(emb_node)) 
+        self.logits_motif = torch.sum(emb_getmotif,1) #(B,1,f)
+        self.logits_motif = self.linear_motif2(self.logits_motif) #(B,1,vocab_length)
+        pd_motif = D.Categorical(logits=self.logits_motif)
+        ac_motif = pd_motif.sample() #(B,1)
+        ac_motif = ac_motif.unsqueeze(-1)
+
+        motif_embs, motif_sembs = self.get_motif_embs(ac_motif) #(B,1,f) (B,n,f)
+
+        if self.ac_real.size>0:
+            ac_motif_real = torch.Tensor(self.ac_real[:,0])
+            ac_motif_real = ac_motif_real.unsqueeze(-1)
+            emb_motif_real,semb_motif_real = self.get_motif_embs(ac_motif_real)
+
         ### 3.1 选第一个有效点(已在分子图中的)
-        self.logits_first = F.relu(self.linear_first1(emb_node)) #(B,n,f)
-        self.logits_first = self.linear_first2(emb_node).squeeze(-1) #(B,n)
+        emb_first_cat = torch.cat((motif_embs.expand(emb_node.shape),emb_node), -1)
+        self.logits_first = F.relu(self.linear_first1(emb_first_cat)) #(B,n,f)
+        self.logits_first = self.linear_first2(self.logits_first).squeeze(-1) #(B,n)
         # 保证选不到无效点
         self.logits_first = self.logits_first.masked_fill(seq_range.expand(self.logits_first.shape)>=ob_len_first.expand(self.logits_first.shape),-10000)
         pd_first = D.Categorical(logits=self.logits_first)
@@ -179,29 +204,30 @@ class GCNPolicy(nn.Module):
         ac_first = ac_first.unsqueeze(-1) #(B,1)
         # 只留选中结点的emb (B,f)
         emb_first = torch.sum(emb_node.masked_fill(seq_range.unsqueeze(-1).expand(emb_node.shape) != ac_first.squeeze(0).unsqueeze(-1).expand(emb_node.shape),0),-2)      
-        # 专家网络ground truth action
+        # 专家网络ground truth action 用ac_real 测logits_real形成的分布的logp
         if self.ac_real.size>0:
-            ac_first_real = torch.Tensor(self.ac_real[:,0])
+            emb_first_cat = torch.cat((emb_motif_real.expand(emb_node.shape),emb_node), -1)
+            self.logits_first_real = F.relu(self.linear_first1(emb_first_cat))
+            self.logits_first_real = self.linear_first2(self.logits_first_real).squeeze(-1)
+            ac_first_real = torch.Tensor(self.ac_real[:,1])
             ac_first_real = ac_first_real.unsqueeze(-1)
             emb_first_real = torch.sum(emb_node.masked_fill(seq_range.unsqueeze(-1).expand(emb_node.shape) != ac_first_real.squeeze(0).unsqueeze(-1).expand(emb_node.shape),0),-2) 
 
         ### 3.2 选第二个点
-        emb_cat = torch.cat((emb_first.unsqueeze(-2).expand(emb_node.shape),emb_node), -1) #(B,n,2f)
+        emb_cat = torch.cat((emb_graph.expand(motif_sembs.shape),emb_first.unsqueeze(-2).expand(motif_sembs.shape),motif_sembs), -1) #(B,n,3f)
         self.logits_second = F.relu(self.linear_second1(emb_cat)) #(B,n,f)
         self.logits_second = self.linear_second2(self.logits_second) #(B,n,1)
-        self.logits_second = self.logits_second.squeeze(-1)
-        self.logits_second = self.logits_second.masked_fill(ac_first.expand(self.logits_second.shape) == seq_range.unsqueeze(0).expand(self.logits_second.shape), -10000)
-        self.logits_second = self.logits_second.masked_fill(seq_range.expand(self.logits_second.shape)>=ob_len.expand(self.logits_second.shape),-10000)
+        self.logits_second = self.logits_second.squeeze(-1)#(B,n)
 
         pd_second = D.Categorical(logits=self.logits_second)
         ac_second = pd_second.sample()
         ac_second = ac_second.unsqueeze(-1)
         # 只留选中结点的emb (B,f)
-        emb_second = torch.sum(emb_node.masked_fill(seq_range.unsqueeze(-1).expand(emb_node.shape) != ac_second.squeeze(0).unsqueeze(-1).expand(emb_node.shape),0),-2) 
+        emb_second = torch.sum(motif_sembs.masked_fill(seq_range.unsqueeze(-1).expand(emb_node.shape) != ac_second.squeeze(0).unsqueeze(-1).expand(emb_node.shape),0),-2) 
 
         # groundtruth
         if self.ac_real.size>0:
-            emb_cat = torch.cat((emb_first_real.unsqueeze(-2).expand(emb_node.shape),emb_node), -1) #(B,n,2f)
+            emb_cat = torch.cat((emb_graph.expand(semb_motif_real.shape),emb_first_real.unsqueeze(-2).expand(semb_motif_real.shape),semb_motif_real), -1) #(B,n,3f)
             self.logits_second_real = F.relu(self.linear_second1(emb_cat))
             self.logits_second_real = self.linear_second2(self.logits_second_real).squeeze(-1)
             ac_second_real = torch.Tensor(self.ac_real[:,1])
@@ -209,7 +235,7 @@ class GCNPolicy(nn.Module):
             emb_second_real = torch.sum(emb_node.masked_fill(seq_range.unsqueeze(-1).expand(emb_node.shape) != ac_second_real.squeeze(0).unsqueeze(-1).expand(emb_node.shape),0),-2)
 
         ### 3.3 预测边类型
-        emb_cat = torch.cat((emb_first,emb_second),-1) #(B,2f)
+        emb_cat = torch.cat((emb_graph.squeeze(1), motif_embs.squeeze(1),emb_first,emb_second),-1) #(B,4f)
         self.logits_edge = F.relu(self.linear_edge1(emb_cat)) #(B,f)
         self.logits_edge = self.linear_edge2(self.logits_edge) #(B,e)
         pd_edge = D.Categorical(logits = self.logits_edge)
@@ -218,7 +244,7 @@ class GCNPolicy(nn.Module):
 
         #groundtruth
         if self.ac_real.size>0:
-            emb_cat = torch.cat((emb_first_real, emb_second_real), -1)
+            emb_cat = torch.cat((emb_graph.squeeze(1),emb_motif_real.squeeze(1), emb_first_real, emb_second_real), -1)
             self.logits_edge_real = F.relu(self.linear_edge1(emb_cat))
             self.logits_edge_real = self.linear_edge2(self.logits_edge_real)
         
@@ -227,10 +253,10 @@ class GCNPolicy(nn.Module):
         self.vpred = torch.max(self.vpred,1).values #(B,1,f)
         self.vpred = self.value2(self.vpred)
 
-        self.ac = torch.cat((ac_first,ac_second,ac_edge,ac_stop),-1)
+        self.ac = torch.cat((ac_motif,ac_first,ac_second,ac_edge,ac_stop),-1)
         self.pd = None
         if self.ac_real.size>0:
-            self.pd = {"first": D.Categorical(logits=self.logits_first), "second": D.Categorical(logits=self.logits_second_real), 
+            self.pd = {"motif": D.Categorical(logits=self.logits_motif),"first": D.Categorical(logits=self.logits_first_real), "second": D.Categorical(logits=self.logits_second_real), 
                         "edge": D.Categorical(logits=self.logits_edge_real), "stop": D.Categorical(logits=self.logits_stop)}
             self.ac_real = np.array([])
         return self.ac, self.vpred
@@ -238,24 +264,55 @@ class GCNPolicy(nn.Module):
     def logp(self, ac):
         ac = torch.LongTensor(ac)
         if self.pd != None: 
-            return self.pd["first"].log_prob(ac[:,0]) + self.pd["second"].log_prob(ac[:,1])\
-                 + self.pd["edge"].log_prob(ac[:,2]) + self.pd["stop"].log_prob(ac[:,3])
+            return self.pd["motif"].log_prob(ac[:,0]) + self.pd["first"].log_prob(ac[:,1]) + self.pd["second"].log_prob(ac[:,2])\
+                 + self.pd["edge"].log_prob(ac[:,3]) + self.pd["stop"].log_prob(ac[:,4])
         else:
             return None
     
     def entorpy(self):
         result = None
         if self.pd != None:
-            result =  self.pd["first"].entropy() + self.pd["second"].entropy()\
+            result = self.pd["motif"].entropy()+ self.pd["first"].entropy() + self.pd["second"].entropy()\
                  + self.pd["edge"].entropy() + self.pd["stop"].entropy()
         return result
 
     def kl(self, other_pd):
         result = None
         if self.pd != None and other_pd != None:
-            result = D.kl_divergence(self.pd["first"], other_pd["first"]) + D.kl_divergence(self.pd["second"], other_pd["second"])\
+            result = D.kl_divergence(self.pd["motif"], other_pd["motif"])+ D.kl_divergence(self.pd["first"], other_pd["first"]) + D.kl_divergence(self.pd["second"], other_pd["second"])\
                 + D.kl_divergence(self.pd["edge"], other_pd["edge"]) + D.kl_divergence(self.pd["stop"], other_pd["stop"])
         return result
+
+    #TODO test
+    def get_motif_embs(self, ac_motif):
+        motif_wholeembs=[]
+        motif_sembs=[]
+
+        for motif_idx in ac_motif:
+            motif_smiles = self.vocab.vocab_list[int(motif_idx.item())]
+            motif_ob = self.env.get_observation_mol(Chem.MolFromSmiles(motif_smiles))
+            motif_adj = torch.Tensor(motif_ob["adj"])
+            motif_node = torch.Tensor(motif_ob["node"])
+            if motif_adj.dim() == 3:
+                motif_adj = motif_adj.unsqueeze(0)
+            if motif_node.dim() == 3:
+                motif_node = motif_node.unsqueeze(0)
+            
+            motif_obnode = self.emb(motif_node)
+            motif_emb = F.relu(self.gcn1(torch.matmul(motif_adj, motif_obnode)))
+            motif_emb = F.relu(self.gcn2(torch.matmul(motif_adj, motif_emb)))
+            motif_emb = F.relu(self.gcn3(torch.matmul(motif_adj, motif_emb)))
+            motif_emb = motif_emb.squeeze(0)
+
+            motif_sinemb = motif_emb.squeeze(0) #(n,f)
+            motif_sembs.append(motif_sinemb.detach().numpy())
+
+            motif_emb = torch.sum(motif_emb,1)
+            motif_wholeembs.append(motif_emb.detach().numpy())
+        motif_wholeembs = torch.Tensor(motif_wholeembs)
+        motif_sembs = torch.Tensor(motif_sembs)
+        return motif_wholeembs, motif_sembs #(B,1,f),(B,n,f)
+
 
 class Discriminator(nn.Module):
     '''
@@ -480,8 +537,8 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
             optim_batchsize, optim_epochs, optim_lr, clip_param=0.2, entcoeff=0.01,
             expert_start=0, expert_end=1e6, rl_start=250, rl_end=1e6, curriculum_num=6, curriculum_step=200, 
             name="test", save_every=50, writer=None, load_name=""):
-    pi = GCNPolicy()
-    old_pi = GCNPolicy()
+    pi = GCNPolicy(env)
+    old_pi = GCNPolicy(env)
     dis_step = Discriminator(pi)
     dis_final = Discriminator(pi)
 
@@ -511,7 +568,9 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
         full_name = './ckpt/' + load_name + ".pt"
         ckpt = torch.load(full_name)
         pi.load_state_dict(ckpt["pi"])
+        '''
         dis_step.load_state_dict(ckpt["loss_d_step"])
+        '''
         dis_final.load_state_dict(ckpt["loss_d_final"])
         iters_so_far = int(load_name.split('_')[-1])+1
 
@@ -554,6 +613,7 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
 
             pretrain_shift = 5
 
+            '''
             ## Expert
             if iters_so_far>=expert_start and iters_so_far<=expert_end+pretrain_shift:
                 ob_expert, ac_expert = env.get_expert(optim_batchsize)
@@ -563,12 +623,13 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
                 pi_logp = pi.logp(ac_expert)
 
                 loss_expert = -torch.mean(pi_logp)
+            '''
             
             ## PPO
             if iters_so_far>=rl_start and iters_so_far<=rl_end:
                 # 源码中把oldpi赋值放在这了 如果不行的话可能真要放这 TODO
                 batch = d.next_batch(optim_batchsize)
-                if iters_so_far >= rl_start+pretrain_shift:  # 等判别器训练一段时间,后再启动traj_generator,因为需要判别器的奖励
+                if iters_so_far >= rl_start:  # 等判别器训练一段时间,后再启动traj_generator,因为需要判别器的奖励
                     pi.set_ac_real(batch["ac"])
                     old_pi.set_ac_real(batch["ac"])
                     batch_acs = batch["ac"]
@@ -600,7 +661,8 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
                     vf_loss = torch.mean(torch.square(pi.vpred - ret)) # 价值函数的loss
                     total_loss = loss_surr + pol_entpen + vf_loss  # PPO阶段的loss
                     losses = {"surr":loss_surr, "pol_entpen":pol_entpen, "vf":vf_loss, "kl":meankl, "entropy":meanent}
-                    
+
+                   
                 if i_optim >= optim_epochs//2:
                     # 更新过程判别器
                     ob_expert ,_ = env.get_expert(optim_batchsize)
@@ -614,10 +676,11 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
                     adam_step_dis.zero_grad()
                     loss_d_step.backward()
                     adam_step_dis.step()
+                
 
                 if i_optim >= optim_epochs//4*3:
                     # 更新结果判别器
-                    ob_expert, _ = env.get_expert(optim_batchsize)
+                    ob_expert, _ = env.get_expert(optim_batchsize, is_final=True)
                     seg_final_adj, seg_final_node = traj_final_generator(pi, copy.deepcopy(env), optim_batchsize)
                     final_pred_real, final_logit_real = dis_final.forward(ob_expert['adj'], ob_expert['node'])
                     final_pred_gen, final_logit_gen = dis_final.forward(seg_final_adj, seg_final_node)
@@ -628,11 +691,13 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
                     adam_final_dis.zero_grad()
                     loss_d_final.backward()
                     adam_final_dis.step()
-            
+            '''
             if loss_expert.item()<8:
                 loss_pi = 0.05*loss_expert + 0.2*total_loss
             else:
                 loss_pi = float(loss_expert.item())/8*0.1*loss_expert+ 0.2*total_loss
+            '''
+            loss_pi = 0.2*total_loss
             adam_pi.zero_grad()
             loss_pi.backward()
             adam_pi.step()
@@ -748,7 +813,7 @@ def main():
     writer = SummaryWriter()
     # 256 32 8
     print(args.name)
-    learn(env, 256, 1, 0.95, 32, 8, 1e-3, writer=writer, load_name=args.name_load, name=args.name)
+    learn(env, 256, 1, 0.95, 32, 8, 1e-3, writer=writer, load_name=args.name_load, name=args.name, rl_start=0)
 
 if __name__ == '__main__':
     main()

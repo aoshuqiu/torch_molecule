@@ -57,7 +57,49 @@ def load_scaffold():
         print('num of scaffolds:', len(data)) #脚手架数量
         return data
 
+class Vocab(object):
+    def __init__(self, vocab_list):
+        self.vocab_list = []
+        for mol_smiles in vocab_list:
+            mol = Chem.MolFromSmiles(mol_smiles)
+            if mol:
+                try:
+                    Chem.SanitizeMol(mol,sanitizeOps=Chem.SanitizeFlags.SANITIZE_KEKULIZE)
+                    self.vocab_list.append(mol_smiles)
+                except:
+                    continue
+        self.vmap = {x: i for i, x in enumerate(self.vocab_list)}
+        self.length = len(self.vocab_list)
+        # if one_hot_perpare:
 
+    def get_vocab_idx(self, vocab):
+        return self.vmap.get(vocab, -1)
+
+    def __getitem__(self, idx):
+        return self.vocab_list[idx]
+
+    def size(self):
+        return self.length
+
+
+def get_vocab_counter(file_path):
+    counter = {}
+    with open(file_path) as f:
+        try:
+            for line in f:
+                line = line.strip()
+                smi, times = line.split('\t')
+                counter[smi] = int(times)
+        except:
+            pass
+    return counter
+
+def get_vocab_set(counter, threshold):
+    vocab_set = set()
+    for k, v in counter.items():
+        if v >= threshold:
+            vocab_set.add(k)
+    return vocab_set
 
 # logp：油水分配系数   SA：光谱 QED：药物相似性 加载分子SMILE和对应性质数据
 def load_conditional(type='low'):
@@ -92,7 +134,7 @@ class MoleculeEnv(gym.Env):
     def __init__(self):
         pass
     # 单纯初始化
-    def init(self,data_type='zinc',logp_ratio=1, qed_ratio=1,sa_ratio=1,reward_step_total=1,is_normalize=0,reward_type='gan',reward_target=0.5,has_scaffold=False,has_feature=False,is_conditional=False,conditional='low',max_action=128,min_action=20,force_final=False):
+    def init(self,data_type='zinc',logp_ratio=1, qed_ratio=1,sa_ratio=1,reward_step_total=1,is_normalize=0,reward_type='gan',reward_target=0.5,has_scaffold=False,has_feature=False,is_conditional=False,conditional='low',max_action=50,min_action=1,force_final=False):
         '''
         own init function, since gym does not support passing argument
         '''
@@ -111,11 +153,22 @@ class MoleculeEnv(gym.Env):
         else:
             self.mol = Chem.RWMol()
         self.smile_list = []
+
+        print("motif version")
+
         if data_type=='gdb':
             possible_atoms = ['C', 'N', 'O', 'S', 'Cl'] # gdb 13
         elif data_type=='zinc':
             possible_atoms = ['C', 'N', 'O', 'S', 'P', 'F', 'I', 'Cl',
                               'Br']  # ZINC
+
+        # 利用从数据中拆分的motif，用频率高的motif形成vocab
+        frag_counter = get_vocab_counter("./dataset/moses/counter1_leaf/fragment_counter.txt")
+        ring_counter = get_vocab_counter("./dataset/moses/counter1_leaf/ring_counter.txt")
+        frag_set = get_vocab_set(frag_counter, 500)
+        ring_set = get_vocab_set(ring_counter, 50)
+        self.vocab = Vocab(set(possible_atoms).union(frag_set.union(ring_set)))
+
         if self.has_feature:
             self.possible_formal_charge = np.array([-1, 0, 1])
             self.possible_implicit_valence = np.array([-1,0, 1, 2, 3, 4])
@@ -130,7 +183,6 @@ class MoleculeEnv(gym.Env):
                 dtype=object)
         possible_bonds = [Chem.rdchem.BondType.SINGLE, Chem.rdchem.BondType.DOUBLE,
                           Chem.rdchem.BondType.TRIPLE] #, Chem.rdchem.BondType.AROMATIC (芳香键) 单键，双键，三键 smiles中是没有芳香键的
-        self.atom_type_num = len(possible_atoms)    # 可能加的原子的类型数
         self.possible_atom_types = np.array(possible_atoms)
         self.possible_bond_types = np.array(possible_bonds, dtype=object)
 
@@ -157,7 +209,7 @@ class MoleculeEnv(gym.Env):
         self.qed_ratio = qed_ratio
         self.sa_ratio = sa_ratio
         self.reward_step_total = reward_step_total
-        self.action_space = gym.spaces.MultiDiscrete([self.max_atom, self.max_atom, 3, 2])
+        self.action_space = gym.spaces.MultiDiscrete([self.vocab.length, self.max_atom, self.max_atom, 3, 2])
         self.observation_space = {}
         self.observation_space['adj'] = gym.Space(shape=[len(possible_bonds), self.max_atom, self.max_atom])
         self.observation_space['node'] = gym.Space(shape=[1, self.max_atom, self.d_n])
@@ -208,7 +260,7 @@ class MoleculeEnv(gym.Env):
     def step(self, action):
         """
         Perform a given action
-        :param action:
+        :param action: [motif, sub_atom_idx, motif_atom_idx, edge_type, stop]
         :param action_type:
         :return: reward of 1 if resulting molecule graph does not exceed valency,
         -1 if otherwise
@@ -220,26 +272,21 @@ class MoleculeEnv(gym.Env):
         total_atoms = self.mol.GetNumAtoms()
 
         ### take action action 矩阵，每行四个元素，分别是动作的四个组成，之后的操作在加链路
-        if action[0,3]==0 or self.counter < self.min_action: # not stop
+        if action[0,4]==0 or self.counter < self.min_action: # not stop
             stop = False
-            if action[0, 1] >= total_atoms:
-                self._add_atom(action[0, 1] - total_atoms)  # add new node
-                action[0, 1] = total_atoms  # new node id
-                self._add_bond(action)  # add new edge
-            else:
-                self._add_bond(action)  # add new edge
+            self._add_motif(action)
         else: # stop
             stop = True
 
         ### calculate intermediate rewards 
         if self.check_valency(): 
             if self.mol.GetNumAtoms()+self.mol.GetNumBonds()-self.mol_old.GetNumAtoms()-self.mol_old.GetNumBonds()>0:
-                reward_step = self.reward_step_total/self.max_atom # successfully add node/edge
+                reward_step = self.reward_step_total
                 self.smile_list.append(self.get_final_smiles())
             else:
-                reward_step = -self.reward_step_total/self.max_atom # edge exist
+                reward_step = -self.reward_step_total #由于原子id没有对上因此没有成功加上motif
         else:
-            reward_step = -self.reward_step_total/self.max_atom  # invalid action
+            reward_step = -self.reward_step_total  # invalid action
             self.mol = self.mol_old
 
         ### calculate terminal rewards
@@ -363,9 +410,14 @@ class MoleculeEnv(gym.Env):
             self.mol = Chem.RWMol(Chem.MolFromSmiles(smile))
             Chem.SanitizeMol(self.mol, sanitizeOps=Chem.SanitizeFlags.SANITIZE_KEKULIZE)
         else:
-            self.mol = Chem.RWMol()
+            while True:
+                first_idx = random.randint(0,self.vocab.length-1)
+                vocab_mol = Chem.MolFromSmiles(self.vocab.vocab_list[first_idx])
+                if vocab_mol:
+                    break
+            self.mol = vocab_mol
+            Chem.SanitizeMol(self.mol, sanitizeOps=Chem.SanitizeFlags.SANITIZE_KEKULIZE)
             # self._add_atom(np.random.randint(len(self.possible_atom_types)))  # random add one atom
-            self._add_atom(0) # always add carbon first
         self.smile_list= [self.get_final_smiles()]
         self.counter = 0
         ob = self.get_observation()
@@ -374,6 +426,48 @@ class MoleculeEnv(gym.Env):
 
     def render(self, mode='human', close=False):
         return
+
+    def _connect_motifs(self, mol_1, mol_2, begin_atom_idx,
+                                   end_atom_idx, bond_type):
+        """
+        Given two rdkit mol objects, begin and end atom indices of the new bond, the bond type, returns a new mol object
+        that has the corresponding bond added. Note that the atom indices are based on the combined mol object, see below
+        MUST PERFORM VALENCY CHECK AFTERWARDS
+        :param mol_1:
+        :param mol_2:
+        :param begin_atom_idx:
+        :param end_atom_idx:
+        :param bond_type:
+        :return: rdkit mol object
+        """
+        combined = Chem.CombineMols(mol_1, mol_2)
+        rw_combined = Chem.RWMol(combined)
+        
+        # check that we have an atom index from each substructure
+        grouped_atom_indices_combined = Chem.GetMolFrags(rw_combined)
+        substructure_1_indices, substructure_2_indices = grouped_atom_indices_combined
+        if begin_atom_idx in substructure_1_indices:
+            if not end_atom_idx in substructure_2_indices:
+                return mol_1
+        elif end_atom_idx in substructure_1_indices:
+            if not begin_atom_idx in substructure_2_indices:
+                return mol_1
+        else:
+            return mol_1
+            
+        rw_combined.AddBond(begin_atom_idx.item(), end_atom_idx.item(), bond_type)
+
+        return rw_combined.GetMol()
+
+    # motif_idx, begin_atom_idx, end_atom_idx, bond_type
+    def _add_motif(self, action):
+        motif_idx = action[0,0]
+        begin_atom_idx = action[0,1]
+        end_atom_idx = action[0,2]
+        bond_type = self.possible_bond_types[action[0,3]]
+        motif_mol = Chem.RWMol(Chem.MolFromSmiles(self.vocab.vocab_list[motif_idx]))
+        Chem.SanitizeMol(motif_mol,sanitizeOps=Chem.SanitizeFlags.SANITIZE_KEKULIZE)
+        self.mol =  self._connect_motifs(Chem.RWMol(self.mol), motif_mol, begin_atom_idx, end_atom_idx, bond_type)
 
     # 添加原子
     def _add_atom(self, atom_type_id):
@@ -582,31 +676,80 @@ class MoleculeEnv(gym.Env):
     # 观测某一分子
     def get_observation_mol(self,mol):
         """
-        ob['adj']:b*n*n --- 'E'
-        ob['node']:1*n*m --- 'F'
-        n = atom_num + atom_type_num
+        ob['adj']:d_e*n*n --- 'E' 代表边类型的邻接矩阵
+        ob['node']:1*n*d_n --- 'F' 1*原子类型*原子嵌入
+        n = atom_num + atom_type_num 原子数目+原子种类数
         """
+        try:
+            Chem.SanitizeMol(mol,sanitizeOps=Chem.SanitizeFlags.SANITIZE_KEKULIZE)
+        except:
+            pass
+        n = mol.GetNumAtoms()
+        n_shift = len(self.possible_atom_types) # assume isolated nodes new nodes exist
 
-        n = self.max_scaffold
-        d_n = len(self.possible_atom_types)
-        F = np.zeros((1, n, d_n))
+
+        F = np.zeros((1, self.max_atom, self.d_n))
         for a in mol.GetAtoms():
             atom_idx = a.GetIdx()
             atom_symbol = a.GetSymbol()
-            float_array = (atom_symbol == self.possible_atom_types).astype(float)
-            assert float_array.sum() != 0
+            if self.has_feature:
+                formal_charge = a.GetFormalCharge()
+                implicit_valence = a.GetImplicitValence()
+                ring_atom = a.IsInRing()
+                degree = a.GetDegree()
+                hybridization = a.GetHybridization()
+            # print(atom_symbol,formal_charge,implicit_valence,ring_atom,degree,hybridization)
+            if self.has_feature:
+                # float_array = np.concatenate([(atom_symbol ==
+                #                                self.possible_atom_types),
+                #                               (formal_charge ==
+                #                                self.possible_formal_charge),
+                #                               (implicit_valence ==
+                #                                self.possible_implicit_valence),
+                #                               (ring_atom ==
+                #                                self.possible_ring_atom),
+                #                               (degree == self.possible_degree),
+                #                               (hybridization ==
+                #                                self.possible_hybridization)]).astype(float)
+                float_array = np.concatenate([(atom_symbol ==
+                                               self.possible_atom_types),
+                                              ([not a.IsInRing()]),
+                                              ([a.IsInRingSize(3)]),
+                                              ([a.IsInRingSize(4)]),
+                                              ([a.IsInRingSize(5)]),
+                                              ([a.IsInRingSize(6)]),
+                                              ([a.IsInRing() and (not a.IsInRingSize(3))
+                                               and (not a.IsInRingSize(4))
+                                               and (not a.IsInRingSize(5))
+                                               and (not a.IsInRingSize(6))]
+                                               )]).astype(float)
+            else:
+                float_array = (atom_symbol == self.possible_atom_types).astype(float)
+            # assert float_array.sum() == 6   # because there are 6 types of one
+            # print(float_array,float_array.sum())
+            # hot atom features
             F[0, atom_idx, :] = float_array
+        # add the atom features for the auxiliary atoms. We only include the
+        # atom symbol features
+        auxiliary_atom_features = np.zeros((n_shift, self.d_n)) # for padding
+        temp = np.eye(n_shift)
+        auxiliary_atom_features[:temp.shape[0], :temp.shape[1]] = temp
+        F[0,n:n+n_shift,:] = auxiliary_atom_features
+        # print('n',n,'n+n_shift',n+n_shift,auxiliary_atom_features.shape)
 
         d_e = len(self.possible_bond_types)
-        E = np.zeros((d_e, n, n))
+        E = np.zeros((d_e, self.max_atom, self.max_atom))
         for i in range(d_e):
-            E[i,:,:] = np.eye(n)
-        for b in mol.GetBonds():
+            E[i,:n+n_shift,:n+n_shift] = np.eye(n+n_shift)
+        for b in self.mol.GetBonds(): # self.mol, very important!! no aromatic
             begin_idx = b.GetBeginAtomIdx()
             end_idx = b.GetEndAtomIdx()
             bond_type = b.GetBondType()
             float_array = (bond_type == self.possible_bond_types).astype(float)
-            assert float_array.sum() != 0
+            try:
+                assert float_array.sum() != 0
+            except:
+                print('error',bond_type)
             E[:, begin_idx, end_idx] = float_array
             E[:, end_idx, begin_idx] = float_array
         ob = {}
@@ -692,41 +835,23 @@ class MoleculeEnv(gym.Env):
                 edge_sample = edge_sample[0] # get value
                 ### get action
                 if edge_sample[0] in graph_sub.nodes() and edge_sample[1] in graph_sub.nodes():
-                    node1 = graph_sub.nodes().index(edge_sample[0])
-                    node2 = graph_sub.nodes().index(edge_sample[1])
+                    node1 = list(graph_sub.nodes()).index(edge_sample[0])
+                    node2 = list(graph_sub.nodes()).index(edge_sample[1])
                 elif edge_sample[0] in graph_sub.nodes():
-                    node1 = graph_sub.nodes().index(edge_sample[0])
+                    node1 = list(graph_sub.nodes()).index(edge_sample[0])
                     node2 = np.argmax(
                         graph.node[edge_sample[1]]['symbol'] == self.possible_atom_types) + graph_sub.number_of_nodes()
                 elif edge_sample[1] in graph_sub.nodes():
-                    node1 = graph_sub.nodes().index(edge_sample[1])
+                    node1 = list(graph_sub.nodes()).index(edge_sample[1])
                     node2 = np.argmax(
                         graph.node[edge_sample[0]]['symbol'] == self.possible_atom_types) + graph_sub.number_of_nodes()
                 else:
                     print('Expert policy error!')
                 edge_type = np.argmax(graph[edge_sample[0]][edge_sample[1]]['bond_type'] == self.possible_bond_types)
                 ac[i,:] = [node1,node2,edge_type,0] # don't stop
-                # print('action',[node1,node2,edge_type,0])
-            # print('action',ac)
-            # plt.axis("off")
-            # nx.draw_networkx(graph_sub)
-            # plt.show()
-            ### get observation
-            # rw_mol = Chem.RWMol()
             n = graph_sub.number_of_nodes()
             for node_id, node in enumerate(graph_sub.nodes()):
                 if self.has_feature:
-                    # float_array = np.concatenate([(graph.node[node]['symbol'] ==
-                    #                                self.possible_atom_types),
-                    #                               (graph.node[node]['formal_charge'] ==
-                    #                                self.possible_formal_charge),
-                    #                               (graph.node[node]['implicit_valence'] ==
-                    #                                self.possible_implicit_valence),
-                    #                               (graph.node[node]['ring_atom'] ==
-                    #                                self.possible_ring_atom),
-                    #                               (graph.node[node]['degree'] == self.possible_degree),
-                    #                               (graph.node[node]['hybridization'] ==
-                    #                                self.possible_hybridization)]).astype(float)
                     cycle_info = nx.cycle_basis(graph_sub, node)
                     cycle_len_info = [len(cycle) for cycle in cycle_info]
                     # print(cycle_len_info)
@@ -758,8 +883,8 @@ class MoleculeEnv(gym.Env):
             for j in range(bond_type_num):
                 ob['adj'][i, j, :n + atom_type_num, :n + atom_type_num] = np.eye(n + atom_type_num)
             for edge in graph_sub.edges():
-                begin_idx = graph_sub.nodes().index(edge[0])
-                end_idx = graph_sub.nodes().index(edge[1])
+                begin_idx = list(graph_sub.nodes()).index(edge[0])
+                end_idx = list(graph_sub.nodes()).index(edge[1])
                 bond_type = graph[edge[0]][edge[1]]['bond_type']
                 float_array = (bond_type == self.possible_bond_types).astype(float)
                 assert float_array.sum() != 0
