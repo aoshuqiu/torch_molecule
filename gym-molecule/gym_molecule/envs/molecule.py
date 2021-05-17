@@ -24,6 +24,8 @@ from rdkit import RDLogger
 from rdkit.rdBase import DisableLog
 from rdkit.rdBase import BlockLogs
 
+from rdkit.Chem.rdmolops import FastFindRings
+
 # TODO(Bowen): check, esp if input is not radical 把自由基电子转化为氢
 def convert_radical_electrons_to_hydrogens(mol):
     """
@@ -203,7 +205,8 @@ class MoleculeEnv(gym.Env):
             if self.is_conditional:
                 self.max_atom = 38 + len(possible_atoms) + self.min_action # ZINC
             else:
-                self.max_atom = 38 + len(possible_atoms) # ZINC  + self.min_action
+                #self.max_atom = 38 + len(possible_atoms) # ZINC  + self.min_action
+                self.max_atom = 60
 
         self.logp_ratio = logp_ratio
         self.qed_ratio = qed_ratio
@@ -283,6 +286,40 @@ class MoleculeEnv(gym.Env):
             if self.mol.GetNumAtoms()+self.mol.GetNumBonds()-self.mol_old.GetNumAtoms()-self.mol_old.GetNumBonds()>0:
                 reward_step = self.reward_step_total
                 self.smile_list.append(self.get_final_smiles())
+                reward_step_t = 0
+                 # property rewards
+
+                mol = self.get_final_mol()
+                if self.reward_type == 'logppen':
+                    # 3. Logp reward. Higher the better
+                    # reward_logp += MolLogP(self.mol)/10 * self.logp_ratio
+                    reward_logp = reward_penalized_log_p(mol) * self.logp_ratio
+                    reward_step_t = reward_penalized_log_p(mol)/3
+                elif self.reward_type == 'logp_target':
+                    # reward_final += reward_target(final_mol,target=self.reward_target,ratio=0.5,val_max=2,val_min=-2,func=MolLogP)
+                    # reward_final += reward_target_logp(final_mol,target=self.reward_target)
+                    reward_step_t = reward_target_new(mol,MolLogP ,x_start=self.reward_target, x_mid=self.reward_target+0.25)
+                elif self.reward_type == 'qed':
+                    reward_qed = qed(mol)*self.qed_ratio
+                    reward_step_t = reward_qed*2
+                elif self.reward_type == 'qedsa':
+                    reward_qed = qed(mol)*self.qed_ratio
+                    # 2. Synthetic accessibility reward. Values naively normalized to [0, 1]. Higher the better 综合可获得性
+                    mol.UpdatePropertyCache()
+                    FastFindRings(mol)
+                    sa = -1 * calculateScore(mol)
+                    reward_sa = (sa + 10) / (10 - 1) * self.sa_ratio
+                    reward_step_t = (reward_qed*1.5 + reward_sa*0.5)
+                elif self.reward_type == 'qed_target':
+                    # reward_final += reward_target(final_mol,target=self.reward_target,ratio=0.1,val_max=2,val_min=-2,func=qed)
+                    reward_step_t = reward_target_qed(mol,target=self.reward_target)
+                elif self.reward_type == 'mw_target':
+                    # reward_final += reward_target(final_mol,target=self.reward_target,ratio=40,val_max=2,val_min=-2,func=rdMolDescriptors.CalcExactMolWt)
+                    # reward_final += reward_target_mw(final_mol,target=self.reward_target)
+                    reward_step_t = reward_target_new(mol, rdMolDescriptors.CalcExactMolWt,x_start=self.reward_target, x_mid=self.reward_target+25)
+                reward_step_t = reward_step_t * (self.mol.GetNumAtoms()/self.max_atom)
+
+                reward_step = reward_step + reward_step_t
             else:
                 reward_step = -self.reward_step_total #由于原子id没有对上因此没有成功加上motif
         else:
@@ -446,6 +483,10 @@ class MoleculeEnv(gym.Env):
         # check that we have an atom index from each substructure
         grouped_atom_indices_combined = Chem.GetMolFrags(rw_combined)
         substructure_1_indices, substructure_2_indices = grouped_atom_indices_combined
+
+        # end_atom_idx 从之前的mol2分子内序号改为组合分子中序号
+        end_atom_idx = end_atom_idx + mol_1.GetNumAtoms()
+
         if begin_atom_idx in substructure_1_indices:
             if not end_atom_idx in substructure_2_indices:
                 return mol_1

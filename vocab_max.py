@@ -26,7 +26,15 @@ from rdkit.rdBase import BlockLogs
 
 class Vocab(object):
     def __init__(self, vocab_list):
-        self.vocab_list = list(vocab_list)
+        self.vocab_list = []
+        for mol_smiles in vocab_list:
+            mol = Chem.MolFromSmiles(mol_smiles)
+            if mol:
+                try:
+                    Chem.SanitizeMol(mol,sanitizeOps=Chem.SanitizeFlags.SANITIZE_KEKULIZE)
+                    self.vocab_list.append(mol_smiles)
+                except:
+                    continue
         self.vmap = {x: i for i, x in enumerate(self.vocab_list)}
         self.length = len(self.vocab_list)
         # if one_hot_perpare:
@@ -64,9 +72,12 @@ frag_counter = get_vocab_counter("./dataset/moses/counter1_leaf/fragment_counter
 ring_counter = get_vocab_counter("./dataset/moses/counter1_leaf/ring_counter.txt")
 frag_set = get_vocab_set(frag_counter, 500)
 ring_set = get_vocab_set(ring_counter, 50)
-vocab = Vocab(frag_set.union(ring_set))
+possible_atoms = ['C', 'N', 'O', 'S', 'P', 'F', 'I', 'Cl','Br']
+vocab = Vocab(set(possible_atoms).union(frag_set.union(ring_set)))
 count = 0
 for v in vocab.vocab_list:
+    if len(v) == 1:
+        print(v)
     mol = Chem.MolFromSmiles(v)
     if mol:
         atom_num = mol.GetNumAtoms()

@@ -92,6 +92,8 @@ class TriEdgeLinear(nn.Module):
 
 class GCNPolicy(nn.Module):
     def __init__(self, env, out_channels=64, stop_shift=0, atom_type_num=9,in_channels=9, edge_type=3, batch_size=32):
+
+        # 观察线性变换的区别，求logits的都保留了bias 但最终求值的都丢弃bias
         super(GCNPolicy, self).__init__()
         self.stop_shift = stop_shift
         self.atom_type_num = atom_type_num
@@ -109,7 +111,8 @@ class GCNPolicy(nn.Module):
 
         self.vocab = env.vocab
         vocab_size = self.vocab.length
-        #TODO test bias
+        print("vacab_size: ", vocab_size)
+        
         self.linear_motif1 = nn.Linear(out_channels, out_channels, bias=False)
         self.linear_motif2 = nn.Linear(out_channels, vocab_size)
 
@@ -447,17 +450,19 @@ class traj_segment_generator:
             prevacs[i] = prevac
             ob, rew_env, new, info = env.step(ac)
             rew_d_step = 0
+
             if rew_env > 0:
                 cur_ep_len_valid += 1
-                
+            '''
                 rew_d_step = self.step_ratio * -1 * (loss_g_gen_discriminator(ob['adj'][np.newaxis, :, :, :], ob['node'][np.newaxis, :, :, :], self.dis_step)) / env.max_atom
+            '''
 
             rew_d_final = 0
+            '''
             if new:
                 rew_d_final = self.final_ratio * -1 * (loss_g_gen_discriminator(ob['adj'][np.newaxis, :, :, :], ob['node'][np.newaxis, :, :, :], self.dis_final))
-
+            '''
             rews[i] = rew_d_step + rew_d_final + rew_env
-
             cur_ep_ret += rews[i]
             cur_ep_ret_d_step += rew_d_step
             cur_ep_ret_d_final += rew_d_final
@@ -476,8 +481,8 @@ class traj_segment_generator:
                 ob_nodes_final.append(ob['node'])
                 ep_rets.append(cur_ep_ret)
                 ep_rets_env.append(cur_ep_ret_env)
-                ep_rets_d_step.append(cur_ep_ret_d_step.detach())
-                ep_rets_d_final.append(cur_ep_ret_d_final.detach())
+                ep_rets_d_step.append(cur_ep_ret_d_step)
+                ep_rets_d_final.append(cur_ep_ret_d_final)
                 ep_lens.append(cur_ep_len)
                 ep_lens_valid.append(cur_ep_len_valid)
                 ep_rew_final.append(rew_env)
@@ -570,8 +575,8 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
         pi.load_state_dict(ckpt["pi"])
         '''
         dis_step.load_state_dict(ckpt["loss_d_step"])
-        '''
         dis_final.load_state_dict(ckpt["loss_d_final"])
+        '''
         iters_so_far = int(load_name.split('_')[-1])+1
 
     while True:
@@ -662,7 +667,11 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
                     total_loss = loss_surr + pol_entpen + vf_loss  # PPO阶段的loss
                     losses = {"surr":loss_surr, "pol_entpen":pol_entpen, "vf":vf_loss, "kl":meankl, "entropy":meanent}
 
-                   
+                ''' 
+                过程判别器与结果判别器训练更新，
+                在环境更换为motif后不再需要，
+                原因： 对抗训练是为了让分子更接近数据集分子，motif就是从数据集中提取得到，此时对抗训练反而成了一个无用限制
+
                 if i_optim >= optim_epochs//2:
                     # 更新过程判别器
                     ob_expert ,_ = env.get_expert(optim_batchsize)
@@ -691,13 +700,15 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
                     adam_final_dis.zero_grad()
                     loss_d_final.backward()
                     adam_final_dis.step()
+                '''
+
             '''
             if loss_expert.item()<8:
                 loss_pi = 0.05*loss_expert + 0.2*total_loss
             else:
                 loss_pi = float(loss_expert.item())/8*0.1*loss_expert+ 0.2*total_loss
             '''
-            loss_pi = 0.2*total_loss
+            loss_pi = 0.2*total_loss.masked_fill(total_loss>2, 2)
             adam_pi.zero_grad()
             loss_pi.backward()
             adam_pi.step()
@@ -792,7 +803,7 @@ def mol_arg_parser():
     parser.add_argument("--name", type=str, default="test")
     parser.add_argument('--name_load', type=str, default="")
     parser.add_argument("--reward_type", type=str, default="qed")
-    parser.add_argument("--reward_step_total", type=float, default=0.5)
+    parser.add_argument("--reward_step_total", type=float, default=1)
     return parser
 
 

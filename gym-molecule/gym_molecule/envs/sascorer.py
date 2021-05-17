@@ -55,8 +55,7 @@ def calculateScore(m):
     readFragmentScores()
 
   # fragment score
-  fp = rdMolDescriptors.GetMorganFingerprint(m,
-                                             2)  #<- 2 is the *radius* of the circular fingerprint
+  fp = rdMolDescriptors.GetMorganFingerprint(m,2)  #<- 2 is the *radius* of the circular fingerprint
   fps = fp.GetNonzeroElements()
   score1 = 0.
   nf = 0
