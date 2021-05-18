@@ -91,7 +91,7 @@ class TriEdgeLinear(nn.Module):
 
 
 class GCNPolicy(nn.Module):
-    def __init__(self, env, out_channels=64, stop_shift=0, atom_type_num=9,in_channels=9, edge_type=3, batch_size=32):
+    def __init__(self, env, out_channels=64, stop_shift=-3, atom_type_num=9,in_channels=9, edge_type=3, batch_size=32):
 
         # 观察线性变换的区别，求logits的都保留了bias 但最终求值的都丢弃bias
         super(GCNPolicy, self).__init__()

@@ -136,7 +136,7 @@ class MoleculeEnv(gym.Env):
     def __init__(self):
         pass
     # 单纯初始化
-    def init(self,data_type='zinc',logp_ratio=1, qed_ratio=1,sa_ratio=1,reward_step_total=1,is_normalize=0,reward_type='gan',reward_target=0.5,has_scaffold=False,has_feature=False,is_conditional=False,conditional='low',max_action=50,min_action=1,force_final=False):
+    def init(self,data_type='zinc',logp_ratio=1, qed_ratio=1,sa_ratio=1,reward_step_total=1,is_normalize=0,reward_type='gan',reward_target=0.5,has_scaffold=False,has_feature=False,is_conditional=False,conditional='low',max_action=128,min_action=20,force_final=False):
         '''
         own init function, since gym does not support passing argument
         '''
@@ -274,10 +274,12 @@ class MoleculeEnv(gym.Env):
         self.mol_old = copy.deepcopy(self.mol) # keep old mol
         total_atoms = self.mol.GetNumAtoms()
 
+        add_atom_reward = 0
+
         ### take action action 矩阵，每行四个元素，分别是动作的四个组成，之后的操作在加链路
         if action[0,4]==0 or self.counter < self.min_action: # not stop
             stop = False
-            self._add_motif(action)
+            add_atom_reward = self._add_motif(action)
         else: # stop
             stop = True
 
@@ -319,11 +321,11 @@ class MoleculeEnv(gym.Env):
                     reward_step_t = reward_target_new(mol, rdMolDescriptors.CalcExactMolWt,x_start=self.reward_target, x_mid=self.reward_target+25)
                 reward_step_t = reward_step_t * (self.mol.GetNumAtoms()/self.max_atom)
 
-                reward_step = reward_step + reward_step_t
+                reward_step = reward_step + reward_step_t + add_atom_reward
             else:
                 reward_step = -self.reward_step_total #由于原子id没有对上因此没有成功加上motif
         else:
-            reward_step = -self.reward_step_total  # invalid action
+            reward_step = -self.reward_step_total # invalid action
             self.mol = self.mol_old
 
         ### calculate terminal rewards
@@ -334,6 +336,7 @@ class MoleculeEnv(gym.Env):
         else:
             terminate_condition = (self.mol.GetNumAtoms() >= self.max_atom-self.possible_atom_types.shape[0] or self.counter >= self.max_action or stop) and self.counter >= self.min_action
         if terminate_condition or self.force_final:
+            print("terminate, mol_size: ",self.mol.GetNumAtoms(),"\t counter: ",self.counter,"\t stop: ",stop)
             # default reward
             reward_valid = 2
             reward_qed = 0
@@ -486,29 +489,37 @@ class MoleculeEnv(gym.Env):
 
         # end_atom_idx 从之前的mol2分子内序号改为组合分子中序号
         end_atom_idx = end_atom_idx + mol_1.GetNumAtoms()
-
-        if begin_atom_idx in substructure_1_indices:
-            if not end_atom_idx in substructure_2_indices:
-                return mol_1
-        elif end_atom_idx in substructure_1_indices:
-            if not begin_atom_idx in substructure_2_indices:
-                return mol_1
-        else:
-            return mol_1
+        if mol_2.GetNumAtoms() == 1:
+            rw_combined.AddBond(begin_atom_idx.item(), mol_1.GetNumAtoms(), bond_type)
+            print("add atom: ", Chem.MolToSmiles(mol_2))
             
-        rw_combined.AddBond(begin_atom_idx.item(), end_atom_idx.item(), bond_type)
+        else:
+            if begin_atom_idx in substructure_1_indices:
+                if not end_atom_idx in substructure_2_indices:
+                    return mol_1
+            elif end_atom_idx in substructure_1_indices:
+                if not begin_atom_idx in substructure_2_indices:
+                    return mol_1
+            else:
+                return mol_1
+                
+            rw_combined.AddBond(begin_atom_idx.item(), end_atom_idx.item(), bond_type)
 
         return rw_combined.GetMol()
 
     # motif_idx, begin_atom_idx, end_atom_idx, bond_type
     def _add_motif(self, action):
+        add_atom_reward = 0
         motif_idx = action[0,0]
         begin_atom_idx = action[0,1]
         end_atom_idx = action[0,2]
         bond_type = self.possible_bond_types[action[0,3]]
         motif_mol = Chem.RWMol(Chem.MolFromSmiles(self.vocab.vocab_list[motif_idx]))
+        if motif_mol.GetNumAtoms() == 1:
+            add_atom_reward = 1
         Chem.SanitizeMol(motif_mol,sanitizeOps=Chem.SanitizeFlags.SANITIZE_KEKULIZE)
         self.mol =  self._connect_motifs(Chem.RWMol(self.mol), motif_mol, begin_atom_idx, end_atom_idx, bond_type)
+        return add_atom_reward
 
     # 添加原子
     def _add_atom(self, atom_type_id):
