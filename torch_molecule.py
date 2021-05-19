@@ -453,15 +453,11 @@ class traj_segment_generator:
 
             if rew_env > 0:
                 cur_ep_len_valid += 1
-            '''
                 rew_d_step = self.step_ratio * -1 * (loss_g_gen_discriminator(ob['adj'][np.newaxis, :, :, :], ob['node'][np.newaxis, :, :, :], self.dis_step)) / env.max_atom
-            '''
 
             rew_d_final = 0
-            '''
             if new:
                 rew_d_final = self.final_ratio * -1 * (loss_g_gen_discriminator(ob['adj'][np.newaxis, :, :, :], ob['node'][np.newaxis, :, :, :], self.dis_final))
-            '''
             rews[i] = rew_d_step + rew_d_final + rew_env
             cur_ep_ret += rews[i]
             cur_ep_ret_d_step += rew_d_step
@@ -481,8 +477,8 @@ class traj_segment_generator:
                 ob_nodes_final.append(ob['node'])
                 ep_rets.append(cur_ep_ret)
                 ep_rets_env.append(cur_ep_ret_env)
-                ep_rets_d_step.append(cur_ep_ret_d_step)
-                ep_rets_d_final.append(cur_ep_ret_d_final)
+                ep_rets_d_step.append(cur_ep_ret_d_step.detach())
+                ep_rets_d_final.append(cur_ep_ret_d_final.detach())
                 ep_lens.append(cur_ep_len)
                 ep_lens_valid.append(cur_ep_len_valid)
                 ep_rew_final.append(rew_env)
@@ -573,10 +569,8 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
         full_name = './ckpt/' + load_name + ".pt"
         ckpt = torch.load(full_name)
         pi.load_state_dict(ckpt["pi"])
-        '''
         dis_step.load_state_dict(ckpt["loss_d_step"])
         dis_final.load_state_dict(ckpt["loss_d_final"])
-        '''
         iters_so_far = int(load_name.split('_')[-1])+1
 
     while True:
@@ -618,7 +612,7 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
 
             pretrain_shift = 5
 
-            '''
+            
             ## Expert
             if iters_so_far>=expert_start and iters_so_far<=expert_end+pretrain_shift:
                 ob_expert, ac_expert = env.get_expert(optim_batchsize)
@@ -628,7 +622,7 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
                 pi_logp = pi.logp(ac_expert)
 
                 loss_expert = -torch.mean(pi_logp)
-            '''
+            
             
             ## PPO
             if iters_so_far>=rl_start and iters_so_far<=rl_end:
@@ -667,10 +661,6 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
                     total_loss = loss_surr + pol_entpen + vf_loss  # PPO阶段的loss
                     losses = {"surr":loss_surr, "pol_entpen":pol_entpen, "vf":vf_loss, "kl":meankl, "entropy":meanent}
 
-                ''' 
-                过程判别器与结果判别器训练更新，
-                在环境更换为motif后不再需要，
-                原因： 对抗训练是为了让分子更接近数据集分子，motif就是从数据集中提取得到，此时对抗训练反而成了一个无用限制
 
                 if i_optim >= optim_epochs//2:
                     # 更新过程判别器
@@ -700,15 +690,10 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
                     adam_final_dis.zero_grad()
                     loss_d_final.backward()
                     adam_final_dis.step()
-                '''
+                
 
-            '''
-            if loss_expert.item()<8:
-                loss_pi = 0.05*loss_expert + 0.2*total_loss
-            else:
-                loss_pi = float(loss_expert.item())/8*0.1*loss_expert+ 0.2*total_loss
-            '''
-            loss_pi = 0.2*total_loss.masked_fill(total_loss>2, 2)
+            
+            loss_pi = 0.05*loss_expert + 0.2*total_loss   
             adam_pi.zero_grad()
             loss_pi.backward()
             adam_pi.step()
@@ -824,7 +809,7 @@ def main():
     writer = SummaryWriter()
     # 256 32 8
     print(args.name)
-    learn(env, 256, 1, 0.95, 32, 8, 1e-3, writer=writer, load_name=args.name_load, name=args.name, rl_start=0)
+    learn(env, 256, 1, 0.95, 32, 8, 1e-3, writer=writer, load_name=args.name_load, name=args.name, rl_start=250)
 
 if __name__ == '__main__':
     main()

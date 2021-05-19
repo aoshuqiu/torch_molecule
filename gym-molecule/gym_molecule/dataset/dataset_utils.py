@@ -36,7 +36,12 @@ def mol_to_nx(mol):
                    implicit_valence=atom.GetImplicitValence(),
                    ring_atom=atom.IsInRing(),
                    degree=atom.GetDegree(),
-                   hybridization=atom.GetHybridization())
+                   hybridization=atom.GetHybridization(),
+                   atomic_num = atom.GetAtomicNum(),
+                   chiral_tag = atom.GetChiralTag(),
+                   is_aromatic = atom.GetIsAromatic(),
+                   num_explicit_hs = atom.GetNumExplicitHs()
+                   )
     for bond in mol.GetBonds():
         G.add_edge(bond.GetBeginAtomIdx(),
                    bond.GetEndAtomIdx(),
@@ -44,8 +49,9 @@ def mol_to_nx(mol):
     return G
 
 
-def nx_to_mol(G):
+def nx_to_mol(G1,G):
     mol = Chem.RWMol()
+    symbol = nx.get_node_attributes(G, 'symbol')
     atomic_nums = nx.get_node_attributes(G, 'atomic_num')
     chiral_tags = nx.get_node_attributes(G, 'chiral_tag')
     formal_charges = nx.get_node_attributes(G, 'formal_charge')
@@ -53,8 +59,8 @@ def nx_to_mol(G):
     node_hybridizations = nx.get_node_attributes(G, 'hybridization')
     num_explicit_hss = nx.get_node_attributes(G, 'num_explicit_hs')
     node_to_idx = {}
-    for node in G.nodes():
-        a=Chem.Atom(atomic_nums[node])
+    for node in G1.nodes():
+        a=Chem.Atom(symbol[node])
         a.SetChiralTag(chiral_tags[node])
         a.SetFormalCharge(formal_charges[node])
         a.SetIsAromatic(node_is_aromatics[node])
@@ -64,10 +70,14 @@ def nx_to_mol(G):
         node_to_idx[node] = idx
 
     bond_types = nx.get_edge_attributes(G, 'bond_type')
-    for edge in G.edges():
-        first, second = edge
+    for edge in G1.edges():
+        (first, second) = edge
         ifirst = node_to_idx[first]
         isecond = node_to_idx[second]
+        if second < first:
+          temp = first
+          first = second
+          second = temp
         bond_type = bond_types[first, second]
         mol.AddBond(ifirst, isecond, bond_type)
 
