@@ -111,7 +111,7 @@ class GCNPolicy(nn.Module):
 
         self.vocab = env.vocab
         vocab_size = self.vocab.length
-        print("vacab_size: ", vocab_size)
+        print("linear_motif2_vacab_size: ", vocab_size)
         
         self.linear_motif1 = nn.Linear(out_channels, out_channels, bias=False)
         self.linear_motif2 = nn.Linear(out_channels, vocab_size)
@@ -166,7 +166,9 @@ class GCNPolicy(nn.Module):
         seq_range = torch.arange(0, emb_node.shape[-2])
         ### 1.计算ob中有效node的个数
         ob_len = torch.sum(torch.BoolTensor(torch.sum(self.node,-1)>0),-1)
-        ob_len_first = ob_len - atom_type_num
+
+        #print("ob_len  ",ob_len)
+        ob_len_first = ob_len
         emb_node = self.mask_emb_len(emb_node, ob_len, 0)
         emb_graph = torch.sum(emb_node,1).unsqueeze(1) #(B,1,f)
 
@@ -226,7 +228,8 @@ class GCNPolicy(nn.Module):
         ac_second = pd_second.sample()
         ac_second = ac_second.unsqueeze(-1)
         # 只留选中结点的emb (B,f)
-        emb_second = torch.sum(motif_sembs.masked_fill(seq_range.unsqueeze(-1).expand(emb_node.shape) != ac_second.squeeze(0).unsqueeze(-1).expand(emb_node.shape),0),-2) 
+        motif_seq_range = torch.arange(0, motif_sembs.shape[-2])
+        emb_second = torch.sum(motif_sembs.masked_fill(motif_seq_range.unsqueeze(-1).expand(motif_sembs.shape) != ac_second.squeeze(0).unsqueeze(-1).expand(motif_sembs.shape),0),-2) 
 
         # groundtruth
         if self.ac_real.size>0:
@@ -235,7 +238,7 @@ class GCNPolicy(nn.Module):
             self.logits_second_real = self.linear_second2(self.logits_second_real).squeeze(-1)
             ac_second_real = torch.Tensor(self.ac_real[:,1])
             ac_second_real = ac_second_real.unsqueeze(-1)
-            emb_second_real = torch.sum(emb_node.masked_fill(seq_range.unsqueeze(-1).expand(emb_node.shape) != ac_second_real.squeeze(0).unsqueeze(-1).expand(emb_node.shape),0),-2)
+            emb_second_real = torch.sum(motif_sembs.masked_fill(motif_seq_range.unsqueeze(-1).expand(motif_sembs.shape) != ac_second_real.squeeze(0).unsqueeze(-1).expand(motif_sembs.shape),0),-2)
 
         ### 3.3 预测边类型
         emb_cat = torch.cat((emb_graph.squeeze(1), motif_embs.squeeze(1),emb_first,emb_second),-1) #(B,4f)
@@ -453,11 +456,15 @@ class traj_segment_generator:
 
             if rew_env > 0:
                 cur_ep_len_valid += 1
+                '''
                 rew_d_step = self.step_ratio * -1 * (loss_g_gen_discriminator(ob['adj'][np.newaxis, :, :, :], ob['node'][np.newaxis, :, :, :], self.dis_step)) / env.max_atom
+                '''
 
             rew_d_final = 0
             if new:
+                '''
                 rew_d_final = self.final_ratio * -1 * (loss_g_gen_discriminator(ob['adj'][np.newaxis, :, :, :], ob['node'][np.newaxis, :, :, :], self.dis_final))
+                '''
             rews[i] = rew_d_step + rew_d_final + rew_env
             cur_ep_ret += rews[i]
             cur_ep_ret_d_step += rew_d_step
@@ -472,13 +479,13 @@ class traj_segment_generator:
                     f.write(str.format(info['smile'], info['reward_valid'], info['reward_qed'], info['reward_sa'], info['final_stat'], rew_env, rew_d_step, 
                     rew_d_final, cur_ep_ret, info['flag_steric_strain_filter'], info['flag_zinc_molecule_filter'], info['stop']))
                     if float(info["reward_qed"])>0.9:
-                        print("OMG finally!")
+                        print("OMG finally! smile: ", info['smile'])
                 ob_adjs_final.append(ob['adj'])
                 ob_nodes_final.append(ob['node'])
                 ep_rets.append(cur_ep_ret)
                 ep_rets_env.append(cur_ep_ret_env)
-                ep_rets_d_step.append(cur_ep_ret_d_step.detach())
-                ep_rets_d_final.append(cur_ep_ret_d_final.detach())
+                ep_rets_d_step.append(cur_ep_ret_d_step) #.detach()
+                ep_rets_d_final.append(cur_ep_ret_d_final) #.detach()
                 ep_lens.append(cur_ep_len)
                 ep_lens_valid.append(cur_ep_len_valid)
                 ep_rew_final.append(rew_env)
@@ -535,9 +542,9 @@ def loss_g_gen_discriminator(adj, node, dis):
     return loss_g_gen
 
 def learn(env, timesteps_per_actorbatch, gamma, lam, 
-            optim_batchsize, optim_epochs, optim_lr, clip_param=0.2, entcoeff=0.01,
+            optim_batchsize, optim_epochs, optim_lr, clip_param=0.2, entcoeff=0.1,
             expert_start=0, expert_end=1e6, rl_start=250, rl_end=1e6, curriculum_num=6, curriculum_step=200, 
-            name="test", save_every=50, writer=None, load_name=""):
+            name="test", save_every=50, writer=None, load_name="", train=True):
     pi = GCNPolicy(env)
     old_pi = GCNPolicy(env)
     dis_step = Discriminator(pi)
@@ -612,16 +619,17 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
 
             pretrain_shift = 5
 
-            
+            '''
             ## Expert
             if iters_so_far>=expert_start and iters_so_far<=expert_end+pretrain_shift:
                 ob_expert, ac_expert = env.get_expert(optim_batchsize)
                 pi.set_ac_real(ac_expert)
                 ac_pred, v_pred = pi.forward(ob_expert['adj'],ob_expert['node'])
-
+                #print("ac_expert:   ",ac_expert)
                 pi_logp = pi.logp(ac_expert)
 
                 loss_expert = -torch.mean(pi_logp)
+            '''
             
             
             ## PPO
@@ -661,7 +669,7 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
                     total_loss = loss_surr + pol_entpen + vf_loss  # PPO阶段的loss
                     losses = {"surr":loss_surr, "pol_entpen":pol_entpen, "vf":vf_loss, "kl":meankl, "entropy":meanent}
 
-
+                '''
                 if i_optim >= optim_epochs//2:
                     # 更新过程判别器
                     ob_expert ,_ = env.get_expert(optim_batchsize)
@@ -690,13 +698,14 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
                     adam_final_dis.zero_grad()
                     loss_d_final.backward()
                     adam_final_dis.step()
+                '''
                 
 
-            
-            loss_pi = 0.05*loss_expert + 0.2*total_loss   
-            adam_pi.zero_grad()
-            loss_pi.backward()
-            adam_pi.step()
+            if train:
+                loss_pi = 0.2*total_loss #+ 0.05*loss_expert 
+                adam_pi.zero_grad()
+                loss_pi.backward()
+                adam_pi.step()
                 
         
         losses = {"surr":0, "pol_entpen":0, "vf":0, "kl":0, "entropy":0}
@@ -789,6 +798,7 @@ def mol_arg_parser():
     parser.add_argument('--name_load', type=str, default="")
     parser.add_argument("--reward_type", type=str, default="qed")
     parser.add_argument("--reward_step_total", type=float, default=1)
+    parser.add_argument("--mode", type=str, default="train")
     return parser
 
 
@@ -804,12 +814,14 @@ def main():
         os.makedirs("./ckpt")
     env = gym.make("molecule-v0")
     env.init(reward_type= args.reward_type, reward_step_total=args.reward_step_total)
-
-
+    if args.mode == "train":
+        train_mode = True
+    elif args.mode == "generate":
+        train_mode = False
     writer = SummaryWriter()
     # 256 32 8
     print(args.name)
-    learn(env, 256, 1, 0.95, 32, 8, 1e-3, writer=writer, load_name=args.name_load, name=args.name, rl_start=250)
+    learn(env, 256, 1, 0.95, 32, 8, 1e-3, writer=writer, load_name=args.name_load, name=args.name, rl_start=0, train=train_mode)
 
 if __name__ == '__main__':
     main()

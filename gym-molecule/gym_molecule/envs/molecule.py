@@ -141,7 +141,7 @@ class MoleculeEnv(gym.Env):
     def __init__(self):
         pass
     # 单纯初始化
-    def init(self,data_type='zinc',logp_ratio=1, qed_ratio=1,sa_ratio=1,reward_step_total=1,is_normalize=0,reward_type='gan',reward_target=0.5,has_scaffold=False,has_feature=False,is_conditional=False,conditional='low',max_action=128,min_action=20,force_final=False):
+    def init(self,data_type='zinc',logp_ratio=1, qed_ratio=1,sa_ratio=1,reward_step_total=1,is_normalize=0,reward_type='gan',reward_target=0.5,has_scaffold=False,has_feature=False,is_conditional=False,conditional='low',max_action=128,min_action=5,force_final=False):
         '''
         own init function, since gym does not support passing argument
         '''
@@ -176,6 +176,7 @@ class MoleculeEnv(gym.Env):
         ring_set = get_vocab_set(ring_counter, 50)
         self.vocab = Vocab(set(possible_atoms).union(frag_set.union(ring_set)))
 
+        self.max_motif_atoms = 10
         if self.has_feature:
             self.possible_formal_charge = np.array([-1, 0, 1])
             self.possible_implicit_valence = np.array([-1,0, 1, 2, 3, 4])
@@ -211,7 +212,7 @@ class MoleculeEnv(gym.Env):
                 self.max_atom = 38 + len(possible_atoms) + self.min_action # ZINC
             else:
                 #self.max_atom = 38 + len(possible_atoms) # ZINC  + self.min_action
-                self.max_atom = 60
+                self.max_atom = 50
 
         self.logp_ratio = logp_ratio
         self.qed_ratio = qed_ratio
@@ -291,7 +292,7 @@ class MoleculeEnv(gym.Env):
         ### calculate intermediate rewards 
         if self.check_valency(): 
             if self.mol.GetNumAtoms()+self.mol.GetNumBonds()-self.mol_old.GetNumAtoms()-self.mol_old.GetNumBonds()>0:
-                reward_step = self.reward_step_total/self.max_atom * 4
+                reward_step = self.reward_step_total/self.max_atom
                 self.smile_list.append(self.get_final_smiles())
                 reward_step_t = 0
                  # property rewards
@@ -328,9 +329,9 @@ class MoleculeEnv(gym.Env):
 
                 reward_step = reward_step + add_atom_reward# + reward_step_t
             else:
-                reward_step = -self.reward_step_total/self.max_atom * 4 #由于原子id没有对上因此没有成功加上motif
+                reward_step = -self.reward_step_total/self.max_atom #由于原子id没有对上因此没有成功加上motif
         else:
-            reward_step = -self.reward_step_total/self.max_atom * 4 # invalid action
+            reward_step = -self.reward_step_total/self.max_atom # invalid action
             self.mol = self.mol_old
 
         ### calculate terminal rewards
@@ -492,6 +493,11 @@ class MoleculeEnv(gym.Env):
         substructure_1_indices, substructure_2_indices = grouped_atom_indices_combined
 
         # end_atom_idx 从之前的mol2分子内序号改为组合分子中序号
+        # print("begin_atom_idx ",begin_atom_idx)
+        # print("end_atom_idx  ", end_atom_idx)
+        # print("combine atoms  ",rw_combined.GetNumAtoms())
+        # print("mol1 atoms  ",mol_1.GetNumAtoms())
+        # print("mol2 atoms  ",mol_2.GetNumAtoms())
         end_atom_idx = end_atom_idx + mol_1.GetNumAtoms()
         if mol_2.GetNumAtoms() == 1:
             rw_combined.AddBond(begin_atom_idx.item(), mol_1.GetNumAtoms(), bond_type)
@@ -505,8 +511,10 @@ class MoleculeEnv(gym.Env):
                     return mol_1
             else:
                 return mol_1
-                
-            rw_combined.AddBond(begin_atom_idx.item(), end_atom_idx.item(), bond_type)
+            try:    
+                rw_combined.AddBond(begin_atom_idx.item(), end_atom_idx.item(), bond_type)
+            except:
+                return mol_1
 
         return rw_combined.GetMol()
 
@@ -658,6 +666,7 @@ class MoleculeEnv(gym.Env):
 
 
         F = np.zeros((1, self.max_atom, self.d_n))
+        #print("mol_size:  ", n)
         for a in mol.GetAtoms():
             atom_idx = a.GetIdx()
             atom_symbol = a.GetSymbol()
@@ -698,18 +707,11 @@ class MoleculeEnv(gym.Env):
             # print(float_array,float_array.sum())
             # hot atom features
             F[0, atom_idx, :] = float_array
-        # add the atom features for the auxiliary atoms. We only include the
-        # atom symbol features
-        auxiliary_atom_features = np.zeros((n_shift, self.d_n)) # for padding
-        temp = np.eye(n_shift)
-        auxiliary_atom_features[:temp.shape[0], :temp.shape[1]] = temp
-        F[0,n:n+n_shift,:] = auxiliary_atom_features
-        # print('n',n,'n+n_shift',n+n_shift,auxiliary_atom_features.shape)
 
         d_e = len(self.possible_bond_types)
         E = np.zeros((d_e, self.max_atom, self.max_atom))
         for i in range(d_e):
-            E[i,:n+n_shift,:n+n_shift] = np.eye(n+n_shift)
+            E[i,:n,:n] = np.eye(n)
         for b in self.mol.GetBonds(): # self.mol, very important!! no aromatic
             begin_idx = b.GetBeginAtomIdx()
             end_idx = b.GetEndAtomIdx()
@@ -740,10 +742,9 @@ class MoleculeEnv(gym.Env):
         except:
             pass
         n = mol.GetNumAtoms()
-        n_shift = len(self.possible_atom_types) # assume isolated nodes new nodes exist
 
-
-        F = np.zeros((1, self.max_atom, self.d_n))
+        #print("mol_atom_num   ", n)
+        F = np.zeros((1, self.max_motif_atoms, self.d_n))
         for a in mol.GetAtoms():
             atom_idx = a.GetIdx()
             atom_symbol = a.GetSymbol()
@@ -784,19 +785,12 @@ class MoleculeEnv(gym.Env):
             # print(float_array,float_array.sum())
             # hot atom features
             F[0, atom_idx, :] = float_array
-        # add the atom features for the auxiliary atoms. We only include the
-        # atom symbol features
-        auxiliary_atom_features = np.zeros((n_shift, self.d_n)) # for padding
-        temp = np.eye(n_shift)
-        auxiliary_atom_features[:temp.shape[0], :temp.shape[1]] = temp
-        F[0,n:n+n_shift,:] = auxiliary_atom_features
-        # print('n',n,'n+n_shift',n+n_shift,auxiliary_atom_features.shape)
 
         d_e = len(self.possible_bond_types)
-        E = np.zeros((d_e, self.max_atom, self.max_atom))
+        E = np.zeros((d_e, self.max_motif_atoms, self.max_motif_atoms))
         for i in range(d_e):
-            E[i,:n+n_shift,:n+n_shift] = np.eye(n+n_shift)
-        for b in self.mol.GetBonds(): # self.mol, very important!! no aromatic
+            E[i,:n,:n] = np.eye(n)
+        for b in mol.GetBonds(): # mol, very important!! no aromatic
             begin_idx = b.GetBeginAtomIdx()
             end_idx = b.GetEndAtomIdx()
             bond_type = b.GetBondType()
@@ -874,7 +868,7 @@ class MoleculeEnv(gym.Env):
             if is_final_temp: # when the subgraph the whole molecule, the expert show stop sign
                 node1 = random.randint(0,mol.GetNumAtoms()-1)
                 while True:
-                    node2 = random.randint(0,mol.GetNumAtoms()+atom_type_num-1)
+                    node2 = random.randint(0,self.max_motif_atoms-1)
                     if node2!=node1:
                         break
                 edge_type = random.randint(0,bond_type_num-1)
@@ -894,18 +888,27 @@ class MoleculeEnv(gym.Env):
                         graphs_num = len(list(connected_graphs))
                         if graphs_num > 1:
                             break
+                graph_subs = copy.deepcopy(graph_sub)
                 graph_subs_list = list(nx.connected_component_subgraphs(graph_sub))
                 graph_subs_list.sort(key=lambda x:len(x),reverse=True)
                 graph_sub = graph_subs_list[0]
                 motif_sub = graph_subs_list[1]
                 edge_sample = edge_sample[0] # get value
                 ### get action
+                # print("++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
+                # print("graph_sub_nodes  ", list(graph_sub.nodes()))
+                # print("motif_sub_nodes  ", list(motif_sub.nodes()))
                 if (edge_sample[0] in graph_sub.nodes() and edge_sample[1] in motif_sub.nodes()):
                     node1 = list(graph_sub.nodes()).index(edge_sample[0])
                     node2 = list(motif_sub.nodes()).index(edge_sample[1])
                 elif (edge_sample[1] in graph_sub.nodes() and edge_sample[0] in motif_sub.nodes()):
                     node1 = list(graph_sub.nodes()).index(edge_sample[1])
                     node2 = list(motif_sub.nodes()).index(edge_sample[0])
+
+                # print("node1: ", node1)
+                # print("node2: ", node2)
+                # print("graph_sub_size", len(graph_sub))
+                # print("motif_sub_size", len(motif_sub))
                 motif_mol = nx_to_mol(motif_sub, graph)
                 Chem.SanitizeMol(motif_mol, sanitizeOps=Chem.SanitizeFlags.SANITIZE_KEKULIZE)
                 motif_idx_ex = -1
@@ -915,6 +918,7 @@ class MoleculeEnv(gym.Env):
                     Chem.SanitizeMol(motif_candi, sanitizeOps=Chem.SanitizeFlags.SANITIZE_KEKULIZE)
                     matches = motif_mol.GetSubstructMatches(motif_candi)
                     if len(matches) > 0:
+                        # print("matches: ", matches)
                         for combine in matches:
                             if node2 in combine:
                                 motif_idx_ex = jj
@@ -922,7 +926,7 @@ class MoleculeEnv(gym.Env):
                                 break
                     if motif_idx_ex > 0:
                         break
-
+                # print("node2: ", node2)
                 edge_type = np.argmax(graph[edge_sample[0]][edge_sample[1]]['bond_type'] == self.possible_bond_types)
                 ac[i,:] = [motif_idx_ex,node1,node2,edge_type,0] # don't stop
             n = graph_sub.number_of_nodes()
