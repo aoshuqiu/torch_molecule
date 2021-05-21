@@ -706,9 +706,12 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
                     loss_pi = 0.2*total_loss #+ 0.05*loss_expert 
                     adam_pi.zero_grad()
                     loss_pi.backward()
+                    
+                    '''
                     with open("./grads.txt","a") as fgrad:
                         for name, param in pi.named_parameters():
-                            fgrad.write(str("{}_grad: {} at {} iters \n".format(name,param.grad,iters_so_far)))     
+                            fgrad.write(str("{}_grad: {} at {} iters \n".format(name,param.grad,iters_so_far)))    
+                    ''' 
                     adam_pi.step()
                 
         
