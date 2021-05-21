@@ -357,7 +357,7 @@ class Discriminator(nn.Module):
 
 # 用策略pi生成一个连续时间段的ob与ac
 class traj_segment_generator:
-    def __init__(self, pi, env, horizon, dis_step, dis_final, step_ratio=1, final_ratio=1):
+    def __init__(self, pi, env, horizon, dis_step, dis_final, step_ratio=1, final_ratio=1, train=True):
         self.pi = pi
         self.env = env
         self.horizon = horizon
@@ -542,7 +542,7 @@ def loss_g_gen_discriminator(adj, node, dis):
     return loss_g_gen
 
 def learn(env, timesteps_per_actorbatch, gamma, lam, 
-            optim_batchsize, optim_epochs, optim_lr, clip_param=0.2, entcoeff=0.1,
+            optim_batchsize, optim_epochs, optim_lr, clip_param=0.2, entcoeff=0.01,
             expert_start=0, expert_end=1e6, rl_start=250, rl_end=1e6, curriculum_num=6, curriculum_step=200, 
             name="test", save_every=50, writer=None, load_name="", train=True):
     pi = GCNPolicy(env)
@@ -563,7 +563,7 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
     rewbuffer_final = deque(maxlen=100)
     rewbuffer_final_stat = deque(maxlen=100)
 
-    traj_gen = traj_segment_generator(pi,env, timesteps_per_actorbatch, dis_step, dis_final)
+    traj_gen = traj_segment_generator(pi,env, timesteps_per_actorbatch, dis_step, dis_final, train)
     seg_gen = traj_gen.get_generator(name=name)
     counter = 0
     level = 0
@@ -702,10 +702,14 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
                 
 
             if train:
-                loss_pi = 0.2*total_loss #+ 0.05*loss_expert 
-                adam_pi.zero_grad()
-                loss_pi.backward()
-                adam_pi.step()
+                if loss_surr <= 0: 
+                    loss_pi = 0.2*total_loss #+ 0.05*loss_expert 
+                    adam_pi.zero_grad()
+                    loss_pi.backward()
+                    with open("./grads.txt","a") as fgrad:
+                        for name, param in pi.named_parameters():
+                            fgrad.write(str("{}_grad: {} at {} iters \n".format(name,param.grad,iters_so_far)))     
+                    adam_pi.step()
                 
         
         losses = {"surr":0, "pol_entpen":0, "vf":0, "kl":0, "entropy":0}
@@ -785,8 +789,9 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
         if (not counter % curriculum_step) and counter//curriculum_step < curriculum_num:
             level += 1
 
-        with open("molecule_gen/"+name+'.csv', 'a') as f:
-                f.write('***** Iteration {} *****\n'.format(iters_so_far))
+        if train:
+            with open("molecule_gen/"+name+'.csv', 'a') as f:
+                    f.write('***** Iteration {} *****\n'.format(iters_so_far))
 
 def arg_parser():
     import argparse
@@ -807,6 +812,7 @@ def mol_arg_parser():
 def main():
     torch.manual_seed(666)
     args = mol_arg_parser().parse_args()
+    #torch.autograd.set_detect_anomaly(True)
     print(os.path.abspath("molecule_gen"))
     if not os.path.exists("molecule_gen"):
         os.makedirs("./molecule_gen")
