@@ -58,6 +58,7 @@ class Dataset(object):
             yield self.next_batch(batch_size)
         self._next_id = 0
 
+
     def subset(self, num_elements, deterministic=True):
         data_map = dict()
         for key in self.data_map:
@@ -77,7 +78,7 @@ class TriEdgeLinear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.edge_num = edge_num
-        self.weight = nn.Parameter(torch.Tensor(edge_num,out_features, in_features))
+        self.weight = nn.Parameter(torch.Tensor(edge_num, in_features, out_features))
         self.reset_parameters()
         
     def reset_parameters(self) -> None:
@@ -85,10 +86,7 @@ class TriEdgeLinear(nn.Module):
     
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         #(B,E,F,F)
-        output = 0
-        for i in range(self.edge_num):
-            output += F.linear(input[:,i,:,:],self.weight[i,:,:])
-        return (output/self.edge_num).unsqueeze(1)
+        return torch.mean(torch.matmul(input, self.weight),1).unsqueeze(1)
 
 
 class GCNPolicy(nn.Module):
@@ -158,6 +156,7 @@ class GCNPolicy(nn.Module):
         ob_len = torch.sum(torch.BoolTensor(torch.sum(self.node,-1)>0),-1)
         ob_len_first = ob_len - atom_type_num
         emb_node = self.mask_emb_len(emb_node, ob_len, 0)
+        
 
         ### 2.预测停止动作
         emb_stop = F.relu(self.linear_stop1(emb_node))
@@ -172,9 +171,9 @@ class GCNPolicy(nn.Module):
 
         ### 3.1 选第一个有效点(已在分子图中的)
         self.logits_first = F.relu(self.linear_first1(emb_node)) #(B,n,f)
-        self.logits_first = self.linear_first2(emb_node).squeeze(-1) #(B,n)
+        self.logits_first = self.linear_first2(self.logits_first).squeeze(-1) #(B,n)
         # 保证选不到无效点
-        self.logits_first = self.logits_first.masked_fill(seq_range.expand(self.logits_first.shape)>=ob_len_first.expand(self.logits_first.shape),-10000)
+        self.logits_first = self.logits_first.masked_fill(seq_range.expand(self.logits_first.shape)>=ob_len_first.expand(self.logits_first.shape),-1000)
         pd_first = D.Categorical(logits=self.logits_first)
         ac_first = pd_first.sample()
         ac_first = ac_first.unsqueeze(-1) #(B,1)
@@ -191,8 +190,8 @@ class GCNPolicy(nn.Module):
         self.logits_second = F.relu(self.linear_second1(emb_cat)) #(B,n,f)
         self.logits_second = self.linear_second2(self.logits_second) #(B,n,1)
         self.logits_second = self.logits_second.squeeze(-1)
-        self.logits_second = self.logits_second.masked_fill(ac_first.expand(self.logits_second.shape) == seq_range.unsqueeze(0).expand(self.logits_second.shape), -10000)
-        self.logits_second = self.logits_second.masked_fill(seq_range.expand(self.logits_second.shape)>=ob_len.expand(self.logits_second.shape),-10000)
+        self.logits_second = self.logits_second.masked_fill(ac_first.expand(self.logits_second.shape) == seq_range.unsqueeze(0).expand(self.logits_second.shape), -1000)
+        self.logits_second = self.logits_second.masked_fill(seq_range.expand(self.logits_second.shape)>=ob_len.expand(self.logits_second.shape),-1000)
 
         pd_second = D.Categorical(logits=self.logits_second)
         ac_second = pd_second.sample()
@@ -238,23 +237,21 @@ class GCNPolicy(nn.Module):
 
     def logp(self, ac):
         ac = torch.LongTensor(ac)
-        if self.pd != None: 
-            return self.pd["first"].log_prob(ac[:,0]) + self.pd["second"].log_prob(ac[:,1])\
-                 + self.pd["edge"].log_prob(ac[:,2]) + self.pd["stop"].log_prob(ac[:,3])
-        else:
-            return None
+        assert self.pd != None, "pd havent been calculated"
+        return self.pd["first"].log_prob(ac[:,0]) + self.pd["second"].log_prob(ac[:,1])\
+                + self.pd["edge"].log_prob(ac[:,2]) + self.pd["stop"].log_prob(ac[:,3])
     
     def entorpy(self):
         result = None
-        if self.pd != None:
-            result =  self.pd["first"].entropy() + self.pd["second"].entropy()\
+        assert self.pd != None, "pd havent been calculated"
+        result =  self.pd["first"].entropy() + self.pd["second"].entropy()\
                  + self.pd["edge"].entropy() + self.pd["stop"].entropy()
         return result
 
     def kl(self, other_pd):
         result = None
-        if self.pd != None and other_pd != None:
-            result = D.kl_divergence(self.pd["first"], other_pd["first"]) + D.kl_divergence(self.pd["second"], other_pd["second"])\
+        assert self.pd != None and other_pd != None, "pd havent been calculated"
+        result = D.kl_divergence(self.pd["first"], other_pd["first"]) + D.kl_divergence(self.pd["second"], other_pd["second"])\
                 + D.kl_divergence(self.pd["edge"], other_pd["edge"]) + D.kl_divergence(self.pd["stop"], other_pd["stop"])
         return result
 
@@ -554,6 +551,7 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
             g_d_final = 0
 
             pretrain_shift = 5
+            ppo_flag = False
 
             ## Expert
             if iters_so_far>=expert_start and iters_so_far<=expert_end+pretrain_shift:
@@ -563,13 +561,14 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
 
                 pi_logp = pi.logp(ac_expert)
 
-                loss_expert = - torch.mean(pi_logp)
+                loss_expert = -torch.mean(pi_logp)
             
             ## PPO
             if iters_so_far>=rl_start and iters_so_far<=rl_end:
                 # 源码中把oldpi赋值放在这了 如果不行的话可能真要放这 TODO
                 batch = d.next_batch(optim_batchsize)
                 if iters_so_far >= rl_start+pretrain_shift:  # 等判别器训练一段时间,后再启动traj_generator,因为需要判别器的奖励
+                    ppo_flag = True
                     pi.set_ac_real(batch["ac"])
                     old_pi.set_ac_real(batch["ac"])
                     batch_acs = batch["ac"]
@@ -584,6 +583,7 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
                     ent = pi.entorpy()
                     meanent = torch.mean(ent)
                     pol_entpen = (-entcoeff) * meanent
+
                     # 两个分布的kl散度
                     kl_oldnew = old_pi.kl(pi.pd)
                     meankl = torch.mean(kl_oldnew)
@@ -617,7 +617,7 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
 
                 if i_optim >= optim_epochs//4*3:
                     # 更新结果判别器
-                    ob_expert, _ = env.get_expert(optim_batchsize)
+                    ob_expert, _ = env.get_expert(optim_batchsize,is_final=True)
                     seg_final_adj, seg_final_node = traj_final_generator(pi, copy.deepcopy(env), optim_batchsize)
                     final_pred_real, final_logit_real = dis_final.forward(ob_expert['adj'], ob_expert['node'])
                     final_pred_gen, final_logit_gen = dis_final.forward(seg_final_adj, seg_final_node)
@@ -629,7 +629,9 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
                     loss_d_final.backward()
                     adam_final_dis.step()
             
-            loss_pi = 0.05*loss_expert + 0.2*total_loss
+            loss_pi = 0.05*loss_expert
+            if ppo_flag and loss_surr <= 0.2:
+                loss_pi = 0.05*loss_expert + 0.2*total_loss
             adam_pi.zero_grad()
             loss_pi.backward()
             adam_pi.step()
@@ -727,9 +729,11 @@ def mol_arg_parser():
     parser.add_argument("--reward_step_total", type=float, default=0.5)
     return parser
 
+
+
+
 def main():
-    torch.manual_seed(999)
-    torch.autograd.set_detect_anomaly(True)
+    torch.manual_seed(666)
     args = mol_arg_parser().parse_args()
     print(os.path.abspath("molecule_gen"))
     if not os.path.exists("molecule_gen"):
@@ -747,3 +751,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+    
