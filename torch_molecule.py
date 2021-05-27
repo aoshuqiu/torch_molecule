@@ -477,7 +477,7 @@ def loss_g_gen_discriminator(adj, node, dis):
 def learn(env, timesteps_per_actorbatch, gamma, lam, 
             optim_batchsize, optim_epochs, optim_lr, clip_param=0.2, entcoeff=0.01,
             expert_start=0, expert_end=1e6, rl_start=250, rl_end=1e6, curriculum_num=6, curriculum_step=200, 
-            name="test", save_every=50, writer=None, load_name=""):
+            name="test", save_every=50, writer=None, load_name="", train=True):
     pi = GCNPolicy()
     old_pi = GCNPolicy()
     dis_step = Discriminator(pi)
@@ -588,12 +588,16 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
                     kl_oldnew = old_pi.kl(pi.pd)
                     meankl = torch.mean(kl_oldnew)
 
+                    atarg = torch.Tensor(atarg)
+
                     ratio = torch.exp(pi_logp - old_pi_logp) # pnew(ac)/pold(ac)
 
-
-                    atarg = torch.Tensor(atarg)
+                    #TR-PPO-RB
+                    kl_epsilon = 0.12
+                    rb_alpha = 0.05
+                    surr2 = torch.where(kl_oldnew < kl_epsilon, ratio * atarg, atarg)
                     surr1 = ratio * atarg
-                    surr2 = torch.clip(ratio, 1.0 - clip_param, 1.0 + clip_param) * atarg
+                    #surr2 = torch.clip(ratio, 1.0 - clip_param, 1.0 + clip_param) * atarg
                     loss_surr = - torch.mean(torch.minimum(surr1, surr2)) # 加负号将目标函数值变为loss
                     
                     ret = torch.Tensor(batch["vtarg"])
@@ -629,12 +633,13 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
                     loss_d_final.backward()
                     adam_final_dis.step()
             
-            loss_pi = 0.05*loss_expert
-            if ppo_flag and loss_surr <= 0.2:
+            #loss_pi = 0.05*loss_expert
+            #if ppo_flag and loss_surr <= 0.2:
+            if train:
                 loss_pi = 0.05*loss_expert + 0.2*total_loss
-            adam_pi.zero_grad()
-            loss_pi.backward()
-            adam_pi.step()
+                adam_pi.zero_grad()
+                loss_pi.backward()
+                adam_pi.step()
                 
         
         losses = {"surr":0, "pol_entpen":0, "vf":0, "kl":0, "entropy":0}
@@ -713,9 +718,9 @@ def learn(env, timesteps_per_actorbatch, gamma, lam,
         counter += 1
         if (not counter % curriculum_step) and counter//curriculum_step < curriculum_num:
             level += 1
-
-        with open("molecule_gen/"+name+'.csv', 'a') as f:
-                f.write('***** Iteration {} *****\n'.format(iters_so_far))
+        if train:
+            with open("molecule_gen/"+name+'.csv', 'a') as f:
+                    f.write('***** Iteration {} *****\n'.format(iters_so_far))
 
 def arg_parser():
     import argparse
@@ -727,6 +732,7 @@ def mol_arg_parser():
     parser.add_argument('--name_load', type=str, default="")
     parser.add_argument("--reward_type", type=str, default="qed")
     parser.add_argument("--reward_step_total", type=float, default=0.5)
+    parser.add_argument("--mode", type=str, default="train")
     return parser
 
 
@@ -743,11 +749,16 @@ def main():
     env = gym.make("molecule-v0")
     env.init(reward_type= args.reward_type, reward_step_total=args.reward_step_total)
 
+    if args.mode == "train":
+        train_mode = True
+    elif args.mode == "generate":
+        train_mode = False
+
 
     writer = SummaryWriter()
     # 256 32 8
     print(args.name)
-    learn(env, 256, 1, 0.95, 32, 8, 1e-3, writer=writer, load_name=args.name_load, name=args.name)
+    learn(env, 256, 1, 0.95, 32, 8, 1e-3, writer=writer, load_name=args.name_load, name=args.name, train=train_mode)
 
 if __name__ == '__main__':
     main()
